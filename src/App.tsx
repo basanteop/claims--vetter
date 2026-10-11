@@ -35,6 +35,14 @@ import {
   LogIn,
   SlidersHorizontal,
   FileSpreadsheet,
+  Wrench,
+  RotateCcw,
+  FileCode,
+  Trash2,
+  Save,
+  Edit3,
+  Activity,
+  ArrowLeftRight,
 } from 'lucide-react';
 import {
   auth,
@@ -63,10 +71,16 @@ import {
   PDF_SOURCE_METADATA,
 } from './data/sampleNhisData';
 import {
+  downloadFixedNhisXml,
   exportDiscrepanciesToCsv,
   exportExtractedRulesToCsv,
   exportVettedReportToPdf,
+  fixAllDiscrepanciesInXml,
+  fixClaimDiscrepanciesInXml,
+  fixSingleDiscrepancyInXml,
   parseAndVetNhisXml,
+  updateClaimManuallyInXml,
+  XmlFixLogItem,
 } from './services/vettingEngine';
 import {
   ResponsiveContainer,
@@ -81,6 +95,7 @@ import {
   Tooltip,
   Legend,
   ReferenceLine,
+  ReferenceArea,
 } from 'recharts';
 
 type NavTab = 'overview' | 'rules' | 'claims' | 'alerts' | 'hipaa';
@@ -168,6 +183,9 @@ export default function App() {
   // Rules & XML State
   const [rules, setRules] = useState<VettingRuleRecord[]>(DEFAULT_PDF_VETTING_RULES);
   const [xmlInput, setXmlInput] = useState<string>(ATTACHED_NHIS_XML_BATCH);
+  const [originalXmlSnapshot, setOriginalXmlSnapshot] = useState<string>(ATTACHED_NHIS_XML_BATCH);
+  const [xmlFixLogs, setXmlFixLogs] = useState<XmlFixLogItem[]>([]);
+  const [showFixHistoryPanel, setShowFixHistoryPanel] = useState<boolean>(false);
   const [loadedXmlFileName, setLoadedXmlFileName] = useState<string>('NHIS_CLA2610173035_1209_830.xml');
   const [loadedPdfFileName, setLoadedPdfFileName] = useState<string>(
     '9 NHIS Vetting Reports (Jul 2025 – May 2026)'
@@ -178,6 +196,9 @@ export default function App() {
     parseAndVetNhisXml(ATTACHED_NHIS_XML_BATCH, DEFAULT_PDF_VETTING_RULES)
   );
   const [trendChartMode, setTrendChartMode] = useState<'split' | 'combined'>('split');
+  const [showAnomalyOverlay, setShowAnomalyOverlay] = useState<boolean>(true);
+  const [anomalySigmaThreshold, setAnomalySigmaThreshold] = useState<1.0 | 1.5 | 2.0>(1.5);
+  const [trendBatchWindow, setTrendBatchWindow] = useState<'5' | 'all'>('5');
 
   // Alerts State
   const [alerts, setAlerts] = useState<LocalAlertItem[]>([]);
@@ -189,6 +210,8 @@ export default function App() {
   const [selectedSeverityFilter, setSelectedSeverityFilter] = useState<string>('ALL');
   const [claimStatusFilter, setClaimStatusFilter] = useState<'all' | 'flagged' | 'clean'>('flagged');
   const [inspectedClaim, setInspectedClaim] = useState<ParsedNhisClaim | null>(null);
+  const [isEditingClaimXml, setIsEditingClaimXml] = useState<boolean>(false);
+  const [editableClaim, setEditableClaim] = useState<ParsedNhisClaim | null>(null);
   const [remediationData, setRemediationData] = useState<{
     claimId: string;
     loading: boolean;
@@ -215,8 +238,14 @@ export default function App() {
     criteriaSummary: '',
   });
 
-  // Cloud Persistence & Audit Trail State
+  // Cloud Persistence, Saved Snapshots & Batch Comparison State
   const [savedReports, setSavedReports] = useState<any[]>([]);
+  const [localSavedReports, setLocalSavedReports] = useState<any[]>([]);
+  const [compareReportAId, setCompareReportAId] = useState<string>('hist_NHIS-2026-04 (03-BA-00415)');
+  const [compareReportBId, setCompareReportBId] = useState<string>('hist_NHIS-2026-05 (03-BA-00415)');
+  const [comparisonMetricFilter, setComparisonMetricFilter] = useState<
+    'all' | 'flagging' | 'financial' | 'categories'
+  >('all');
   const [auditLogs, setAuditLogs] = useState<LocalAuditLogItem[]>([
     {
       logId: 'log_boot_1',
@@ -434,6 +463,8 @@ export default function App() {
       const content = event.target?.result as string;
       if (content) {
         setXmlInput(content);
+        setOriginalXmlSnapshot(content);
+        setXmlFixLogs([]);
         setLoadedXmlFileName(file.name);
         setStatusBanner({
           type: 'success',
@@ -621,15 +652,49 @@ export default function App() {
     }
   };
 
-  // Save current AuditReport & Critical Alerts to Firestore
+  // Save current AuditReport to Saved Database (Local Snapshot + Firestore Cloud when authenticated)
   const handleSaveReportToCloud = async () => {
+    const timestampTag = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const snapshotId = sanitizeId(`${vettedResult.reportId}_${Date.now().toString().slice(-5)}`);
+    const snapshotRecord = {
+      id: snapshotId,
+      reportId: snapshotId,
+      batchNumber: `${vettedResult.batchNumber} (${xmlFixLogs.length > 0 ? `${xmlFixLogs.length} Fixed` : 'Snapshot'} @ ${timestampTag})`,
+      facilityName: vettedResult.facilityName,
+      serviceMonth: vettedResult.serviceMonth,
+      serviceYear: vettedResult.serviceYear,
+      totalClaims: vettedResult.parsedClaimsCount,
+      totalBatchAmount: vettedResult.calculatedSubmittedTotalGhs,
+      submittedServiceGhs: vettedResult.calculatedSubmittedServiceGhs,
+      submittedMedicineGhs: vettedResult.calculatedSubmittedMedicineGhs,
+      flaggedClaimsCount: vettedResult.flaggedClaimsCount,
+      estimatedAdjustmentAmount: vettedResult.totalAdjustedGhs,
+      adjustedServiceGhs: vettedResult.totalAdjustedServiceGhs,
+      adjustedMedicineGhs: vettedResult.totalAdjustedMedicineGhs,
+      criticalAlertsCount: vettedResult.criticalAlertsCount,
+      rulesTriggeredCount: vettedResult.ruleBreakdown.length,
+      status: 'in_review',
+      hipaaEncryptionHash: vettedResult.hipaaEncryptionHash,
+      savedAtLabel: `Saved ${timestampTag}`,
+    };
+
+    setLocalSavedReports((prev) => [snapshotRecord, ...prev]);
+    setCompareReportBId(`saved_${snapshotId}`);
+
     if (!currentUser) {
+      await recordHipaaLog(
+        'SAVE_LOCAL_REPORT_SNAPSHOT',
+        'AuditReport',
+        snapshotId,
+        `Saved audit report snapshot ${snapshotRecord.batchNumber} to local comparison database.`
+      );
       setStatusBanner({
-        type: 'error',
-        text: 'Please sign in with Google in the top bar to save audit reports to Firestore.',
+        type: 'success',
+        text: `Saved Audit Report snapshot (${snapshotRecord.batchNumber}) to comparison database. Sign in with Google to also sync to Firestore.`,
       });
       return;
     }
+
     const reportDocId = sanitizeId(vettedResult.reportId);
     const path = 'auditReports';
     try {
@@ -655,11 +720,11 @@ export default function App() {
         'SAVE_AUDIT_REPORT',
         'AuditReport',
         reportDocId,
-        `Saved vetted batch report ${vettedResult.batchNumber} (${vettedResult.flaggedClaimsCount} flagged claims).`
+        `Saved vetted batch report ${vettedResult.batchNumber} (${vettedResult.flaggedClaimsCount} flagged claims) to Firestore.`
       );
       setStatusBanner({
         type: 'success',
-        text: `Saved Audit Report (${vettedResult.batchNumber}) to encrypted Firestore database.`,
+        text: `Saved Audit Report (${vettedResult.batchNumber}) to encrypted Firestore database and selected in Batch Comparison.`,
       });
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, path);
@@ -800,8 +865,44 @@ export default function App() {
 
   const openAlertsCount = useMemo(() => alerts.filter((a) => a.status === 'open').length, [alerts]);
 
-  // Last 5 Audited Batches Trend Data (Prior 4 historical/cloud batches + current active audited batch)
-  const lastFiveBatchesTrend = useMemo<HistoricalBatchTrendItem[]>(() => {
+  // Historical Baseline Statistical Parameters (Mean μ, Standard Deviation σ, and ±kσ Control Corridor)
+  const complianceAnomalyStats = useMemo(() => {
+    const cloudMappedRates = savedReports
+      .filter((r) => r.batchNumber && r.batchNumber !== vettedResult.batchNumber)
+      .slice(0, 4)
+      .map((r) => {
+        const total = Number(r.totalClaims) || 1;
+        const flagged = Number(r.flaggedClaimsCount) || 0;
+        return Number((((total - flagged) / total) * 100).toFixed(1));
+      });
+
+    const baselineRates = [
+      ...HISTORICAL_AUDITED_BATCHES.map((b) => b.complianceRate),
+      ...cloudMappedRates,
+    ];
+    const n = baselineRates.length || 1;
+    const mean = baselineRates.reduce((acc, val) => acc + val, 0) / n;
+    const variance =
+      n > 1
+        ? baselineRates.reduce((acc, val) => acc + Math.pow(val - mean, 2), 0) / (n - 1)
+        : 0;
+    const stdDev = Math.max(0.5, Math.sqrt(variance));
+
+    const upperThreshold = Number(Math.min(100, mean + anomalySigmaThreshold * stdDev).toFixed(1));
+    const lowerThreshold = Number(Math.max(0, mean - anomalySigmaThreshold * stdDev).toFixed(1));
+
+    return {
+      mean: Number(mean.toFixed(1)),
+      stdDev: Number(stdDev.toFixed(2)),
+      upperThreshold,
+      lowerThreshold,
+      sigmaMultiplier: anomalySigmaThreshold,
+      sampleSize: n,
+    };
+  }, [savedReports, vettedResult.batchNumber, anomalySigmaThreshold]);
+
+  // Audited Batches Trend Data enriched with Statistical Z-Score & Anomaly Classification
+  const lastFiveBatchesTrend = useMemo(() => {
     const cloudMapped: HistoricalBatchTrendItem[] = savedReports
       .filter((r) => r.batchNumber && r.batchNumber !== vettedResult.batchNumber)
       .slice(0, 4)
@@ -842,9 +943,41 @@ export default function App() {
     };
 
     const combinedHistory = [...HISTORICAL_AUDITED_BATCHES, ...cloudMapped];
-    const priorFour = combinedHistory.slice(-4);
-    return [...priorFour, currentBatchItem];
-  }, [savedReports, vettedResult]);
+    const selectedHistory = trendBatchWindow === 'all' ? combinedHistory : combinedHistory.slice(-4);
+    const rawSeries = [...selectedHistory, currentBatchItem];
+
+    return rawSeries.map((item) => {
+      const zScore = Number(
+        ((item.complianceRate - complianceAnomalyStats.mean) / complianceAnomalyStats.stdDev).toFixed(2)
+      );
+      const deviationFromMean = Number((item.complianceRate - complianceAnomalyStats.mean).toFixed(1));
+      const isLowOutlier = item.complianceRate < complianceAnomalyStats.lowerThreshold;
+      const isHighOutlier = item.complianceRate > complianceAnomalyStats.upperThreshold;
+      const isAnomaly = isLowOutlier || isHighOutlier;
+      const anomalyType: 'low_outlier' | 'high_outlier' | 'normal' = isLowOutlier
+        ? 'low_outlier'
+        : isHighOutlier
+        ? 'high_outlier'
+        : 'normal';
+
+      return {
+        ...item,
+        zScore,
+        deviationFromMean,
+        isAnomaly,
+        anomalyType,
+        historicalMean: complianceAnomalyStats.mean,
+        historicalStdDev: complianceAnomalyStats.stdDev,
+        upperThreshold: complianceAnomalyStats.upperThreshold,
+        lowerThreshold: complianceAnomalyStats.lowerThreshold,
+      };
+    });
+  }, [savedReports, vettedResult, trendBatchWindow, complianceAnomalyStats]);
+
+  const detectedAnomalyBatches = useMemo(
+    () => lastFiveBatchesTrend.filter((b) => b.isAnomaly),
+    [lastFiveBatchesTrend]
+  );
 
   const complianceTrendDelta = useMemo(() => {
     if (lastFiveBatchesTrend.length < 2) return 0;
@@ -852,6 +985,359 @@ export default function App() {
     const last = lastFiveBatchesTrend[lastFiveBatchesTrend.length - 1].complianceRate;
     return Number((last - first).toFixed(1));
   }, [lastFiveBatchesTrend]);
+
+  // Custom SVG Dot Renderer for Recharts Compliance Series with Anomaly Detection Overlay
+  const renderComplianceAnomalyDot = (props: any) => {
+    const { cx, cy, payload } = props;
+    if (typeof cx !== 'number' || typeof cy !== 'number' || !payload) return null;
+
+    if (showAnomalyOverlay && payload.isAnomaly) {
+      const isLow = payload.anomalyType === 'low_outlier';
+      const strokeColor = isLow ? '#dc2626' : '#0284c7';
+      const fillColor = isLow ? '#dc2626' : '#0284c7';
+      const zLabel = `${payload.zScore > 0 ? '+' : ''}${payload.zScore}σ`;
+      const labelY = cy < 32 ? cy + 22 : cy - 14;
+
+      return (
+        <g key={`anomaly-dot-${payload.batchId}`}>
+          <circle
+            cx={cx}
+            cy={cy}
+            r={12}
+            fill={fillColor}
+            fillOpacity={0.2}
+            stroke={strokeColor}
+            strokeWidth={1.2}
+            strokeDasharray="2 2"
+          />
+          <circle
+            cx={cx}
+            cy={cy}
+            r={6}
+            fill={fillColor}
+            stroke="#ffffff"
+            strokeWidth={2}
+          />
+          <rect
+            x={cx - 22}
+            y={labelY - 9}
+            width={44}
+            height={14}
+            rx={3}
+            fill={isLow ? '#7f1d1d' : '#0c4a6e'}
+          />
+          <text
+            x={cx}
+            y={labelY + 1}
+            textAnchor="middle"
+            fill="#ffffff"
+            fontSize={9}
+            fontWeight={700}
+            fontFamily="JetBrains Mono, monospace"
+          >
+            {zLabel}
+          </text>
+        </g>
+      );
+    }
+
+    return (
+      <circle
+        key={`normal-dot-${payload.batchId}`}
+        cx={cx}
+        cy={cy}
+        r={4}
+        fill="#0f766e"
+        stroke="#ffffff"
+        strokeWidth={1.5}
+      />
+    );
+  };
+
+  // Custom Statistical Tooltip for Compliance Trend Chart
+  const renderComplianceAnomalyTooltip = ({ active, payload }: any) => {
+    if (!active || !payload || !payload.length) return null;
+    const data = payload[0]?.payload;
+    if (!data) return null;
+
+    const isLow = data.anomalyType === 'low_outlier';
+    const isHigh = data.anomalyType === 'high_outlier';
+
+    return (
+      <div className="bg-slate-950 text-slate-100 p-3.5 rounded-lg shadow-xl border border-slate-800 text-xs font-mono space-y-2 max-w-xs">
+        <div className="flex items-center justify-between gap-4 border-b border-slate-800 pb-1.5">
+          <span className="font-sans font-bold text-white">{data.period}</span>
+          <span className="text-slate-400 text-[11px]">{data.batchId}</span>
+        </div>
+
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-slate-400">Compliance Rate:</span>
+            <span
+              className={`font-bold ${
+                isLow ? 'text-red-400' : isHigh ? 'text-sky-400' : 'text-emerald-400'
+              }`}
+            >
+              {Number(data.complianceRate).toFixed(1)}%
+            </span>
+          </div>
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-slate-400">Historical Mean (μ ± σ):</span>
+            <span className="text-slate-200">
+              {data.historicalMean}% ± {data.historicalStdDev}%
+            </span>
+          </div>
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-slate-400">Std Dev Z-Score:</span>
+            <span
+              className={`font-bold ${
+                isLow ? 'text-red-400' : isHigh ? 'text-sky-400' : 'text-emerald-400'
+              }`}
+            >
+              {data.zScore > 0 ? `+${data.zScore}σ` : `${data.zScore}σ`} ({data.deviationFromMean > 0 ? `+${data.deviationFromMean}%` : `${data.deviationFromMean}%`})
+            </span>
+          </div>
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-slate-400">Normal ±{anomalySigmaThreshold}σ Corridor:</span>
+            <span className="text-slate-300">
+              {data.lowerThreshold}% – {data.upperThreshold}%
+            </span>
+          </div>
+        </div>
+
+        <div className="border-t border-slate-800 pt-1.5 space-y-1 text-[11px]">
+          <div className="flex items-center justify-between">
+            <span className="text-slate-400">Submitted / Disallowed:</span>
+            <span className="text-slate-200">
+              GHS {Number(data.submittedValueGhs).toLocaleString()} / -GHS {Number(data.adjustedValueGhs).toLocaleString()}
+            </span>
+          </div>
+          <div
+            className={`pt-1 font-sans font-semibold ${
+              isLow ? 'text-red-400' : isHigh ? 'text-sky-400' : 'text-emerald-400'
+            }`}
+          >
+            {isLow
+              ? `ANOMALY DETECTED: Below -${anomalySigmaThreshold}σ Historical Threshold`
+              : isHigh
+              ? `OUTLIER DETECTED: Above +${anomalySigmaThreshold}σ Historical Threshold`
+              : `NORMAL: Within ±${anomalySigmaThreshold}σ Historical Distribution`}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // Unified Database Catalog of Saved Audit Reports (Firestore Cloud + Saved Snapshots + Historical Database + Active Batch)
+  const comparableDatabaseReports = useMemo(() => {
+    const buildCategorySplit = (
+      totalFlagged: number,
+      totalAdjGhs: number,
+      weights = { Clinical: 0.31, Pharmacy: 0.34, Tariff: 0.22, Documentation: 0.08, Membership: 0.05 }
+    ) => {
+      const cats: Array<'Clinical' | 'Pharmacy' | 'Tariff' | 'Documentation' | 'Membership'> = [
+        'Clinical',
+        'Pharmacy',
+        'Tariff',
+        'Documentation',
+        'Membership',
+      ];
+      const out: Record<
+        'Clinical' | 'Pharmacy' | 'Tariff' | 'Documentation' | 'Membership',
+        { flaggedCount: number; adjustedGhs: number }
+      > = {
+        Clinical: { flaggedCount: 0, adjustedGhs: 0 },
+        Pharmacy: { flaggedCount: 0, adjustedGhs: 0 },
+        Tariff: { flaggedCount: 0, adjustedGhs: 0 },
+        Documentation: { flaggedCount: 0, adjustedGhs: 0 },
+        Membership: { flaggedCount: 0, adjustedGhs: 0 },
+      };
+      for (const c of cats) {
+        const w = weights[c];
+        out[c] = {
+          flaggedCount: Math.round(totalFlagged * w),
+          adjustedGhs: Number((totalAdjGhs * w).toFixed(2)),
+        };
+      }
+      return out;
+    };
+
+    // 1. Live Active Vetted XML Batch Report
+    const activeCatBreakdown: Record<
+      'Clinical' | 'Pharmacy' | 'Tariff' | 'Documentation' | 'Membership',
+      { flaggedCount: number; adjustedGhs: number }
+    > = {
+      Clinical: { flaggedCount: 0, adjustedGhs: 0 },
+      Pharmacy: { flaggedCount: 0, adjustedGhs: 0 },
+      Tariff: { flaggedCount: 0, adjustedGhs: 0 },
+      Documentation: { flaggedCount: 0, adjustedGhs: 0 },
+      Membership: { flaggedCount: 0, adjustedGhs: 0 },
+    };
+    for (const rb of vettedResult.ruleBreakdown) {
+      const cat = rb.category;
+      if (activeCatBreakdown[cat]) {
+        activeCatBreakdown[cat].flaggedCount += rb.affectedClaimsCount;
+        activeCatBreakdown[cat].adjustedGhs = Number(
+          (activeCatBreakdown[cat].adjustedGhs + rb.totalCostGhs).toFixed(2)
+        );
+      }
+    }
+
+    const activeTotal = Math.max(1, vettedResult.parsedClaimsCount);
+    const activeFlaggingPct = Number(((vettedResult.flaggedClaimsCount / activeTotal) * 100).toFixed(2));
+    const activeSubTotal = Math.max(0.01, vettedResult.calculatedSubmittedTotalGhs);
+
+    const activeEntry = {
+      uid: 'active_live_xml_batch',
+      groupLabel: 'Active XML Audit Session',
+      displayTitle: `[Active XML Batch] ${vettedResult.batchNumber} (${vettedResult.serviceMonth}/${vettedResult.serviceYear})`,
+      shortPeriod: `Mar ${vettedResult.serviceYear} (Active XML)`,
+      batchNumber: vettedResult.batchNumber,
+      reportDate: vettedResult.creationDate,
+      status: xmlFixLogs.length > 0 ? 'remediated' : 'in_review',
+      totalClaims: vettedResult.parsedClaimsCount,
+      flaggedClaims: vettedResult.flaggedClaimsCount,
+      cleanClaims: vettedResult.cleanClaimsCount,
+      flaggingRatePct: activeFlaggingPct,
+      complianceRatePct: vettedResult.complianceScorePercent,
+      submittedTotalGhs: vettedResult.calculatedSubmittedTotalGhs,
+      submittedServiceGhs: vettedResult.calculatedSubmittedServiceGhs,
+      submittedMedicineGhs: vettedResult.calculatedSubmittedMedicineGhs,
+      adjustedTotalGhs: vettedResult.totalAdjustedGhs,
+      adjustedServiceGhs: vettedResult.totalAdjustedServiceGhs,
+      adjustedMedicineGhs: vettedResult.totalAdjustedMedicineGhs,
+      netApprovedGhs: vettedResult.netAmountDueGhs,
+      adjustmentRatePct: Number(((vettedResult.totalAdjustedGhs / activeSubTotal) * 100).toFixed(2)),
+      avgAdjustmentPerFlaggedGhs:
+        vettedResult.flaggedClaimsCount > 0
+          ? Number((vettedResult.totalAdjustedGhs / vettedResult.flaggedClaimsCount).toFixed(2))
+          : 0,
+      criticalAlertsCount: vettedResult.criticalAlertsCount,
+      rulesTriggeredCount: vettedResult.ruleBreakdown.length,
+      categoryBreakdown: activeCatBreakdown,
+    };
+
+    // 2. Cloud Firestore Saved Reports + Local Saved Snapshots
+    const combinedSavedRaw = [...localSavedReports, ...savedReports];
+    const seenSavedIds = new Set<string>();
+    const savedEntries = combinedSavedRaw
+      .filter((r) => {
+        const key = String(r.id || r.reportId || r.batchNumber);
+        if (seenSavedIds.has(key)) return false;
+        seenSavedIds.add(key);
+        return true;
+      })
+      .map((r) => {
+        const key = String(r.id || r.reportId || r.batchNumber);
+        const total = Math.max(1, Number(r.totalClaims) || 1);
+        const flagged = Number(r.flaggedClaimsCount) || 0;
+        const clean = Math.max(0, total - flagged);
+        const flaggingPct = Number(((flagged / total) * 100).toFixed(2));
+        const compliancePct = Number((100 - flaggingPct).toFixed(1));
+        const subTotal = Number(r.totalBatchAmount) || 0;
+        const subServ = Number(r.submittedServiceGhs ?? subTotal * 0.64);
+        const subMed = Number(r.submittedMedicineGhs ?? subTotal - subServ);
+        const adjTotal = Number(r.estimatedAdjustmentAmount) || 0;
+        const adjServ = Number(r.adjustedServiceGhs ?? adjTotal * 0.42);
+        const adjMed = Number(r.adjustedMedicineGhs ?? adjTotal - adjServ);
+        const netDue = Number(Math.max(0, subTotal - adjTotal).toFixed(2));
+        const adjRatePct = subTotal > 0 ? Number(((adjTotal / subTotal) * 100).toFixed(2)) : 0;
+
+        return {
+          uid: `saved_${key}`,
+          groupLabel: 'Saved Cloud & Session Audit Reports',
+          displayTitle: `[Saved DB] ${r.batchNumber} (${r.serviceMonth || '03'}/${r.serviceYear || '2026'})`,
+          shortPeriod: `${r.serviceMonth || '03'}/${r.serviceYear || '2026'} (Saved DB)`,
+          batchNumber: String(r.batchNumber),
+          reportDate: r.savedAtLabel || 'Firestore Synced',
+          status: String(r.status || 'in_review'),
+          totalClaims: total,
+          flaggedClaims: flagged,
+          cleanClaims: clean,
+          flaggingRatePct: flaggingPct,
+          complianceRatePct: compliancePct,
+          submittedTotalGhs: Number(subTotal.toFixed(2)),
+          submittedServiceGhs: Number(subServ.toFixed(2)),
+          submittedMedicineGhs: Number(subMed.toFixed(2)),
+          adjustedTotalGhs: Number(adjTotal.toFixed(2)),
+          adjustedServiceGhs: Number(adjServ.toFixed(2)),
+          adjustedMedicineGhs: Number(adjMed.toFixed(2)),
+          netApprovedGhs: netDue,
+          adjustmentRatePct: adjRatePct,
+          avgAdjustmentPerFlaggedGhs: flagged > 0 ? Number((adjTotal / flagged).toFixed(2)) : 0,
+          criticalAlertsCount: Number(r.criticalAlertsCount) || 0,
+          rulesTriggeredCount: Number(r.rulesTriggeredCount) || 12,
+          categoryBreakdown: buildCategorySplit(flagged, adjTotal),
+        };
+      });
+
+    // 3. Official Historical Audited Batch Reports Database (Jul 2025 – May 2026)
+    const historicalEntries = HISTORICAL_AUDITED_BATCHES.map((h, idx) => {
+      const total = Math.max(1, h.totalClaims);
+      const flagged = h.flaggedClaims;
+      const clean = Math.max(0, total - flagged);
+      const flaggingPct = Number(((flagged / total) * 100).toFixed(2));
+      const subTotal = h.submittedValueGhs;
+      const subServ = Number((subTotal * (0.62 + (idx % 3) * 0.02)).toFixed(2));
+      const subMed = Number((subTotal - subServ).toFixed(2));
+      const adjTotal = h.adjustedValueGhs;
+      const adjServ = Number((adjTotal * (0.41 + (idx % 4) * 0.03)).toFixed(2));
+      const adjMed = Number((adjTotal - adjServ).toFixed(2));
+      const adjRatePct = subTotal > 0 ? Number(((adjTotal / subTotal) * 100).toFixed(2)) : 0;
+
+      const weights = {
+        Clinical: Number((0.28 + (idx % 3) * 0.03).toFixed(2)),
+        Pharmacy: Number((0.35 - (idx % 2) * 0.02).toFixed(2)),
+        Tariff: Number((0.23 - (idx % 3) * 0.01).toFixed(2)),
+        Documentation: 0.09,
+        Membership: 0.05,
+      };
+
+      return {
+        uid: `hist_${h.batchId}`,
+        groupLabel: 'Saved Historical Audit Database (Jul 2025 – May 2026)',
+        displayTitle: `[Database Report] ${h.period} — ${h.batchId} (${flaggingPct}% Flagged)`,
+        shortPeriod: h.period,
+        batchNumber: h.batchId,
+        reportDate: h.reportDate,
+        status: 'locked',
+        totalClaims: total,
+        flaggedClaims: flagged,
+        cleanClaims: clean,
+        flaggingRatePct: flaggingPct,
+        complianceRatePct: h.complianceRate,
+        submittedTotalGhs: subTotal,
+        submittedServiceGhs: subServ,
+        submittedMedicineGhs: subMed,
+        adjustedTotalGhs: adjTotal,
+        adjustedServiceGhs: adjServ,
+        adjustedMedicineGhs: adjMed,
+        netApprovedGhs: h.netApprovedGhs,
+        adjustmentRatePct: adjRatePct,
+        avgAdjustmentPerFlaggedGhs: flagged > 0 ? Number((adjTotal / flagged).toFixed(2)) : 0,
+        criticalAlertsCount: Math.max(4, Math.round(flagged * 0.18)),
+        rulesTriggeredCount: h.rulesTriggeredCount,
+        categoryBreakdown: buildCategorySplit(flagged, adjTotal, weights),
+      };
+    });
+
+    return [...savedEntries, activeEntry, ...historicalEntries];
+  }, [vettedResult, xmlFixLogs.length, localSavedReports, savedReports]);
+
+  const selectedComparisonReports = useMemo(() => {
+    const fallbackA =
+      comparableDatabaseReports.find((r) => r.uid === 'hist_NHIS-2026-04 (03-BA-00415)') ||
+      comparableDatabaseReports[0];
+    const fallbackB =
+      comparableDatabaseReports.find((r) => r.uid === 'hist_NHIS-2026-05 (03-BA-00415)') ||
+      comparableDatabaseReports[1] ||
+      comparableDatabaseReports[0];
+
+    const reportA = comparableDatabaseReports.find((r) => r.uid === compareReportAId) || fallbackA;
+    const reportB = comparableDatabaseReports.find((r) => r.uid === compareReportBId) || fallbackB;
+
+    return { reportA, reportB };
+  }, [comparableDatabaseReports, compareReportAId, compareReportBId]);
 
   const handleExportPdf = () => {
     exportVettedReportToPdf(vettedResult, maskPhi);
@@ -871,6 +1357,205 @@ export default function App() {
       vettedResult.batchNumber,
       `Exported ${vettedResult.discrepancies.length} discrepancy findings to CSV (PHI Masked: ${maskPhi}).`
     );
+  };
+
+  // Fix a single discrepancy in the XML batch
+  const handleFixSingleDiscrepancy = (discrepancy: ClaimDiscrepancy) => {
+    if (activeRole === 'viewer') {
+      setStatusBanner({ type: 'error', text: 'Viewer role is read-only and cannot modify XML claims.' });
+      return;
+    }
+    const { updatedXml, actionTaken } = fixSingleDiscrepancyInXml(xmlInput, discrepancy);
+    setXmlInput(updatedXml);
+    const newFixEntry: XmlFixLogItem = {
+      id: `fix_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      claimId: discrepancy.claimId,
+      ruleCode: discrepancy.ruleCode,
+      ruleTitle: discrepancy.ruleTitle,
+      actionTaken,
+      amountAdjustedGhs: discrepancy.financialAdjustmentGhs,
+      timestamp: new Date().toLocaleTimeString(),
+    };
+    setXmlFixLogs((prev) => [newFixEntry, ...prev]);
+
+    // Refresh inspectedClaim if open
+    const nextVetted = parseAndVetNhisXml(updatedXml, rules);
+    if (inspectedClaim && inspectedClaim.claimId === discrepancy.claimId) {
+      const updatedClaimObj = nextVetted.claims.find((c) => c.claimId === discrepancy.claimId) || null;
+      setInspectedClaim(updatedClaimObj);
+      setEditableClaim(updatedClaimObj ? JSON.parse(JSON.stringify(updatedClaimObj)) : null);
+    }
+
+    setStatusBanner({
+      type: 'success',
+      text: `Fixed ${discrepancy.ruleCode} on Claim ${discrepancy.claimId}: ${actionTaken}.`,
+    });
+    recordHipaaLog(
+      'FIX_XML_DISCREPANCY',
+      'ClaimXML',
+      discrepancy.claimId,
+      `${discrepancy.ruleCode}: ${actionTaken}`
+    );
+  };
+
+  // Fix all discrepancies on a specific claim
+  const handleFixSingleClaim = (claimId: string) => {
+    if (activeRole === 'viewer') {
+      setStatusBanner({ type: 'error', text: 'Viewer role is read-only and cannot modify XML claims.' });
+      return;
+    }
+    const claimDiscs = discrepanciesByClaim.get(claimId) || [];
+    if (claimDiscs.length === 0) return;
+
+    const { updatedXml, actionsTaken } = fixClaimDiscrepanciesInXml(xmlInput, claimId, vettedResult.discrepancies);
+    setXmlInput(updatedXml);
+
+    const newEntries: XmlFixLogItem[] = claimDiscs.map((d, idx) => ({
+      id: `fix_${Date.now()}_${idx}`,
+      claimId: d.claimId,
+      ruleCode: d.ruleCode,
+      ruleTitle: d.ruleTitle,
+      actionTaken: actionsTaken.find((a) => a.startsWith(d.ruleCode)) || `Resolved ${d.ruleTitle}`,
+      amountAdjustedGhs: d.financialAdjustmentGhs,
+      timestamp: new Date().toLocaleTimeString(),
+    }));
+    setXmlFixLogs((prev) => [...newEntries, ...prev]);
+
+    const nextVetted = parseAndVetNhisXml(updatedXml, rules);
+    if (inspectedClaim && inspectedClaim.claimId === claimId) {
+      const updatedClaimObj = nextVetted.claims.find((c) => c.claimId === claimId) || null;
+      setInspectedClaim(updatedClaimObj);
+      setEditableClaim(updatedClaimObj ? JSON.parse(JSON.stringify(updatedClaimObj)) : null);
+    }
+
+    setStatusBanner({
+      type: 'success',
+      text: `Fixed ${claimDiscs.length} issue(s) on Claim ${claimId}. Ready for compliant XML download.`,
+    });
+    recordHipaaLog(
+      'FIX_CLAIM_XML',
+      'ClaimXML',
+      claimId,
+      `Auto-fixed ${claimDiscs.length} discrepancy(ies) on claim ${claimId}.`
+    );
+  };
+
+  // Fix all discrepancies for a specific rule across the batch
+  const handleFixRuleDiscrepancies = (ruleCode: string) => {
+    if (activeRole === 'viewer') {
+      setStatusBanner({ type: 'error', text: 'Viewer role is read-only and cannot modify XML claims.' });
+      return;
+    }
+    const { updatedXml, fixLogs } = fixAllDiscrepanciesInXml(xmlInput, rules, ruleCode);
+    if (fixLogs.length === 0) return;
+    setXmlInput(updatedXml);
+    setXmlFixLogs((prev) => [...fixLogs, ...prev]);
+    setStatusBanner({
+      type: 'success',
+      text: `Auto-fixed ${fixLogs.length} claim discrepancy(ies) for rule ${ruleCode} in XML batch.`,
+    });
+    recordHipaaLog(
+      'FIX_RULE_XML_BATCH',
+      'BatchXML',
+      ruleCode,
+      `Auto-fixed ${fixLogs.length} discrepancy(ies) under ${ruleCode}.`
+    );
+  };
+
+  // Auto-Fix ALL discrepancies across the entire XML batch
+  const handleAutoFixAllIssues = () => {
+    if (activeRole === 'viewer') {
+      setStatusBanner({ type: 'error', text: 'Viewer role is read-only and cannot modify XML claims.' });
+      return;
+    }
+    const { updatedXml, fixLogs } = fixAllDiscrepanciesInXml(xmlInput, rules);
+    if (fixLogs.length === 0) {
+      setStatusBanner({
+        type: 'info',
+        text: 'All claims in the current XML batch already pass 100% of active NHIS vetting rules.',
+      });
+      return;
+    }
+    setXmlInput(updatedXml);
+    setXmlFixLogs((prev) => [...fixLogs, ...prev]);
+    setClaimStatusFilter('all');
+    setShowFixHistoryPanel(true);
+    setStatusBanner({
+      type: 'success',
+      text: `Auto-remediated ${fixLogs.length} compliance discrepancy(ies) across the XML batch. Batch is now 100% compliant and ready to download!`,
+    });
+    recordHipaaLog(
+      'AUTO_FIX_ALL_BATCH_XML',
+      'BatchXML',
+      vettedResult.batchNumber,
+      `Remediated ${fixLogs.length} discrepancy findings across the batch to achieve 100% NHIS compliance.`
+    );
+  };
+
+  // Save manual edits from the Claim Inspector XML Editor
+  const handleSaveManualClaimEdits = () => {
+    if (!editableClaim) return;
+    if (activeRole === 'viewer') {
+      setStatusBanner({ type: 'error', text: 'Viewer role is read-only and cannot modify XML claims.' });
+      return;
+    }
+    const updatedXml = updateClaimManuallyInXml(xmlInput, editableClaim);
+    setXmlInput(updatedXml);
+
+    const nextVetted = parseAndVetNhisXml(updatedXml, rules);
+    const refreshed = nextVetted.claims.find((c) => c.claimId === editableClaim.claimId) || null;
+    setInspectedClaim(refreshed);
+    setEditableClaim(refreshed ? JSON.parse(JSON.stringify(refreshed)) : null);
+    setIsEditingClaimXml(false);
+
+    const manualLog: XmlFixLogItem = {
+      id: `fix_manual_${Date.now()}`,
+      claimId: editableClaim.claimId,
+      ruleCode: 'MANUAL-EDIT',
+      ruleTitle: 'AUDITOR MANUAL XML CORRECTION',
+      actionTaken: `Updated XML fields/line items on ${editableClaim.claimId} (G-DRG: ${editableClaim.inPatientCode || editableClaim.outPatientCode}, Meds: ${editableClaim.medicines.length}, Treatments: ${editableClaim.treatments.length})`,
+      amountAdjustedGhs: 0,
+      timestamp: new Date().toLocaleTimeString(),
+    };
+    setXmlFixLogs((prev) => [manualLog, ...prev]);
+    setStatusBanner({
+      type: 'success',
+      text: `Saved manual XML corrections to Claim ${editableClaim.claimId} and re-vetted batch.`,
+    });
+    recordHipaaLog(
+      'MANUAL_EDIT_CLAIM_XML',
+      'ClaimXML',
+      editableClaim.claimId,
+      manualLog.actionTaken
+    );
+  };
+
+  // Download the Fixed XML file
+  const handleDownloadFixedXml = () => {
+    downloadFixedNhisXml(xmlInput, vettedResult.batchNumber);
+    setStatusBanner({
+      type: 'success',
+      text: `Downloaded fixed NHIS XML batch (${vettedResult.parsedClaimsCount} claims, ${vettedResult.complianceScorePercent}% compliance).`,
+    });
+    recordHipaaLog(
+      'DOWNLOAD_FIXED_XML',
+      'BatchXML',
+      vettedResult.batchNumber,
+      `Downloaded remediated XML batch (${xmlFixLogs.length} fixes applied, ${vettedResult.complianceScorePercent}% compliant).`
+    );
+  };
+
+  // Reset XML back to original uploaded/attached state
+  const handleResetXmlToOriginal = () => {
+    setXmlInput(originalXmlSnapshot);
+    setXmlFixLogs([]);
+    setShowFixHistoryPanel(false);
+    setClaimStatusFilter('flagged');
+    setStatusBanner({
+      type: 'info',
+      text: 'Restored original unmodified XML claims batch.',
+    });
+    recordHipaaLog('RESET_XML_BATCH', 'BatchXML', vettedResult.batchNumber, 'Reverted XML batch to original unedited state.');
   };
 
   const handleAddCustomRule = (e: React.FormEvent) => {
@@ -1087,6 +1772,39 @@ export default function App() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5">
+            {vettedResult.discrepancies.length > 0 && (
+              <button
+                onClick={handleAutoFixAllIssues}
+                className="px-3.5 py-2 text-xs font-semibold text-white bg-amber-600 hover:bg-amber-700 rounded-lg transition-colors flex items-center gap-2 whitespace-nowrap shrink-0 shadow-sm"
+              >
+                <Wrench className="w-3.5 h-3.5" />
+                Auto-Fix All Issues ({vettedResult.discrepancies.length})
+              </button>
+            )}
+
+            <button
+              onClick={handleDownloadFixedXml}
+              className={`px-3.5 py-2 text-xs font-semibold rounded-lg transition-colors flex items-center gap-2 whitespace-nowrap shrink-0 ${
+                xmlFixLogs.length > 0
+                  ? 'text-white bg-emerald-700 hover:bg-emerald-800 shadow-sm'
+                  : 'text-slate-800 bg-emerald-50 border border-emerald-300 hover:bg-emerald-100'
+              }`}
+            >
+              <FileCode className="w-3.5 h-3.5" />
+              Download Fixed XML {xmlFixLogs.length > 0 ? `(${xmlFixLogs.length} Fixed)` : ''}
+            </button>
+
+            {xmlFixLogs.length > 0 && (
+              <button
+                onClick={handleResetXmlToOriginal}
+                className="px-3 py-2 text-xs font-medium text-slate-600 border border-slate-300 hover:bg-slate-100 rounded-lg transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                title="Revert all XML fixes back to original unedited batch"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                Reset XML
+              </button>
+            )}
+
             <button
               onClick={handleExtractFromAttachedFiles}
               disabled={isExtractingPdf}
@@ -1138,13 +1856,67 @@ export default function App() {
 
             <button
               onClick={handleSaveReportToCloud}
-              className="px-3.5 py-2 text-xs font-medium text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg transition-colors flex items-center gap-2 whitespace-nowrap shrink-0"
+              className="px-3.5 py-2 text-xs font-medium text-white bg-slate-800 hover:bg-slate-900 rounded-lg transition-colors flex items-center gap-2 whitespace-nowrap shrink-0"
             >
               <ShieldCheck className="w-3.5 h-3.5" />
               Save Report to Cloud
             </button>
           </div>
         </section>
+
+        {/* Live XML Remediation & Download Strip (Shown when fixes are applied or available) */}
+        {xmlFixLogs.length > 0 && (
+          <section className="bg-emerald-950 text-emerald-50 border border-emerald-800 rounded-xl p-4 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+                <div>
+                  <h2 className="text-sm font-bold text-white">
+                    XML Batch Remediated · {xmlFixLogs.length} Compliance Issue(s) Fixed ({vettedResult.complianceScorePercent}% Clean-Claim Rate)
+                  </h2>
+                  <p className="text-xs text-emerald-200 mt-0.5">
+                    All fixed claims, recalculated G-DRG tariffs, prescription quantities, and batch totals have been updated in the XML DOM.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2.5">
+                <button
+                  onClick={() => setShowFixHistoryPanel((prev) => !prev)}
+                  className="px-3 py-1.5 text-xs font-medium text-emerald-100 bg-emerald-900/80 hover:bg-emerald-800 border border-emerald-700 rounded-lg transition-colors"
+                >
+                  {showFixHistoryPanel ? 'Hide Fix Log' : `View Fix Changelog (${xmlFixLogs.length})`}
+                </button>
+                <button
+                  onClick={handleDownloadFixedXml}
+                  className="px-4 py-1.5 text-xs font-bold text-slate-950 bg-emerald-400 hover:bg-emerald-300 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Download Fixed XML (.xml)
+                </button>
+              </div>
+            </div>
+
+            {showFixHistoryPanel && (
+              <div className="bg-slate-900/90 border border-emerald-800/80 rounded-lg p-3 max-h-52 overflow-y-auto divide-y divide-slate-800 text-xs font-mono">
+                {xmlFixLogs.map((item) => (
+                  <div key={item.id} className="py-1.5 flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-slate-200">
+                      <span className="text-emerald-400 font-bold">{item.claimId}</span>
+                      <span className="text-slate-500">·</span>
+                      <span className="text-amber-300">{item.ruleCode}</span>
+                      <span className="text-slate-500">·</span>
+                      <span className="font-sans text-slate-100">{item.actionTaken}</span>
+                    </div>
+                    <span className="text-emerald-300">
+                      {item.amountAdjustedGhs > 0 ? `Resolved GHS ${item.amountAdjustedGhs.toFixed(2)}` : item.timestamp}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+        )}
 
         {/* High-Density KPI Strip */}
         <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
@@ -1210,24 +1982,74 @@ export default function App() {
         {/* TAB 1: OVERVIEW (Batch Trends, Vetting Summary Sheet & Numbered Reasons for Adjustments) */}
         {activeTab === 'overview' && (
           <div className="space-y-6">
-            {/* Five-Batch Compliance Rate & Claim Value Trend Visualization (Recharts) */}
+            {/* Multi-Batch Compliance Rate & Claim Value Trend Visualization with Statistical Anomaly Detection Overlay */}
             <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-5">
               <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-200 pb-4">
                 <div>
                   <h2 className="text-base font-bold text-slate-900">
-                    01. Multi-Batch Compliance Rate & Claim Value Trends (Last 5 Audited Batches)
+                    01. Multi-Batch Compliance Rate & Claim Value Trends ({trendBatchWindow === '5' ? 'Last 5 Audited Batches' : `All ${lastFiveBatchesTrend.length} Audited Batches`})
                   </h2>
                   <p className="text-xs text-slate-500 mt-0.5">
-                    Tracks clean-claim compliance percentage alongside submitted, adjusted, and net approved claim values (GHS) across the five most recent NHIS batch audits.
+                    Tracks clean-claim compliance percentage with a ±{anomalySigmaThreshold}σ statistical standard deviation anomaly overlay alongside submitted, adjusted, and net approved claim values (GHS).
                   </p>
                 </div>
 
-                <div className="flex items-center gap-3">
-                  <div className="text-xs text-slate-600 font-mono tabular-nums">
-                    5-Batch Compliance Shift:{' '}
-                    <span className={`font-bold ${complianceTrendDelta >= 0 ? 'text-emerald-700' : 'text-red-700'}`}>
-                      {complianceTrendDelta >= 0 ? `+${complianceTrendDelta}%` : `${complianceTrendDelta}%`}
-                    </span>
+                <div className="flex flex-wrap items-center gap-2.5">
+                  {/* Anomaly Detection Overlay Toggle */}
+                  <button
+                    onClick={() => setShowAnomalyOverlay((prev) => !prev)}
+                    className={`px-3 py-1.5 text-xs font-semibold rounded-lg border transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
+                      showAnomalyOverlay
+                        ? 'bg-red-950 text-red-100 border-red-800 shadow-sm'
+                        : 'bg-slate-100 text-slate-600 border-slate-200 hover:text-slate-900'
+                    }`}
+                  >
+                    <Activity className={`w-3.5 h-3.5 ${showAnomalyOverlay ? 'text-red-400' : 'text-slate-500'}`} />
+                    <span>Anomaly Overlay: {showAnomalyOverlay ? 'ON' : 'OFF'}</span>
+                  </button>
+
+                  {/* Sigma Sensitivity Threshold Selector */}
+                  {showAnomalyOverlay && (
+                    <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
+                      {([1.0, 1.5, 2.0] as const).map((sigma) => (
+                        <button
+                          key={sigma}
+                          onClick={() => setAnomalySigmaThreshold(sigma)}
+                          className={`px-2.5 py-1 text-xs font-mono font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                            anomalySigmaThreshold === sigma
+                              ? 'bg-slate-900 text-white shadow-sm'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                          title={`Highlight batches falling outside ±${sigma.toFixed(1)} standard deviations from historical mean`}
+                        >
+                          ±{sigma.toFixed(1)}σ
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Batch Window Selector (Last 5 vs All 12 Batches) */}
+                  <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
+                    <button
+                      onClick={() => setTrendBatchWindow('5')}
+                      className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                        trendBatchWindow === '5'
+                          ? 'bg-white text-slate-900 shadow-sm'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      Last 5 Batches
+                    </button>
+                    <button
+                      onClick={() => setTrendBatchWindow('all')}
+                      className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                        trendBatchWindow === 'all'
+                          ? 'bg-white text-slate-900 shadow-sm'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      All 12 Batches
+                    </button>
                   </div>
 
                   {/* Interactive Chart Mode Toggle */}
@@ -1256,27 +2078,135 @@ export default function App() {
                 </div>
               </div>
 
+              {/* Statistical Control Corridor & Anomaly Detection Diagnostic Strip */}
+              {showAnomalyOverlay && (
+                <div
+                  className={`rounded-lg border p-3.5 text-xs space-y-2.5 ${
+                    detectedAnomalyBatches.some((b) => b.anomalyType === 'low_outlier')
+                      ? 'bg-red-50/70 border-red-200 text-slate-900'
+                      : 'bg-slate-50 border-slate-200 text-slate-800'
+                  }`}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex flex-wrap items-center gap-2 font-mono tabular-nums">
+                      <span className="font-sans font-bold text-slate-900">
+                        Statistical Baseline ({complianceAnomalyStats.sampleSize} Historical Audits):
+                      </span>
+                      <span>Mean μ = {complianceAnomalyStats.mean}%</span>
+                      <span aria-hidden="true" className="text-slate-400">·</span>
+                      <span>Std Dev σ = ±{complianceAnomalyStats.stdDev}%</span>
+                      <span aria-hidden="true" className="text-slate-400">·</span>
+                      <span className="text-teal-800 font-semibold">
+                        Normal ±{anomalySigmaThreshold.toFixed(1)}σ Corridor: [{complianceAnomalyStats.lowerThreshold}% – {complianceAnomalyStats.upperThreshold}%]
+                      </span>
+                      <span aria-hidden="true" className="text-slate-400">·</span>
+                      <span
+                        className={`font-bold ${
+                          detectedAnomalyBatches.length > 0 ? 'text-red-700' : 'text-emerald-700'
+                        }`}
+                      >
+                        {detectedAnomalyBatches.length} Statistical Anomaly Batch(es) Flagged
+                      </span>
+                    </div>
+
+                    {vettedResult.discrepancies.length > 0 && (
+                      <button
+                        onClick={handleAutoFixAllIssues}
+                        className="px-3 py-1 text-xs font-semibold text-white bg-red-700 hover:bg-red-800 rounded-md transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                      >
+                        <Wrench className="w-3.5 h-3.5" />
+                        Remediate Active Batch Anomaly
+                      </button>
+                    )}
+                  </div>
+
+                  {detectedAnomalyBatches.length > 0 ? (
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2.5 pt-1">
+                      {detectedAnomalyBatches.map((anom) => {
+                        const isLow = anom.anomalyType === 'low_outlier';
+                        return (
+                          <div
+                            key={anom.batchId}
+                            className={`p-2.5 rounded-md border flex items-start justify-between gap-2 ${
+                              isLow
+                                ? 'bg-white border-red-200 text-slate-900'
+                                : 'bg-white border-sky-200 text-slate-900'
+                            }`}
+                          >
+                            <div className="space-y-0.5 min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <AlertTriangle
+                                  className={`w-3.5 h-3.5 shrink-0 ${
+                                    isLow ? 'text-red-600' : 'text-sky-600'
+                                  }`}
+                                />
+                                <span className="font-bold text-slate-900 truncate">{anom.period}</span>
+                                <span aria-hidden="true" className="text-slate-400">·</span>
+                                <span
+                                  className={`font-mono font-bold ${
+                                    isLow ? 'text-red-700' : 'text-sky-700'
+                                  }`}
+                                >
+                                  {anom.complianceRate.toFixed(1)}%
+                                </span>
+                              </div>
+                              <p className="text-[11px] text-slate-600 truncate" title={anom.batchId}>
+                                {isLow
+                                  ? `Drops ${Math.abs(anom.deviationFromMean).toFixed(1)}% below historical mean (${anom.flaggedClaims} claims flagged)`
+                                  : `Exceeds upper +${anomalySigmaThreshold}σ threshold (+${anom.deviationFromMean.toFixed(1)}% above μ)`}
+                              </p>
+                            </div>
+                            <span
+                              className={`font-mono font-bold text-xs shrink-0 ${
+                                isLow ? 'text-red-700' : 'text-sky-700'
+                              }`}
+                            >
+                              {anom.zScore > 0 ? `+${anom.zScore}σ` : `${anom.zScore}σ`}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-emerald-800">
+                      All displayed batches fall within the expected ±{anomalySigmaThreshold.toFixed(1)}σ historical compliance corridor ({complianceAnomalyStats.lowerThreshold}% – {complianceAnomalyStats.upperThreshold}%).
+                    </p>
+                  )}
+                </div>
+              )}
+
               {trendChartMode === 'split' ? (
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                  {/* Chart A: Compliance Rate Trend (%) */}
+                  {/* Chart A: Compliance Rate Trend (%) with Statistical Standard Deviation Overlay */}
                   <div className="border border-slate-200 rounded-lg p-4 space-y-3">
                     <div className="flex items-center justify-between">
                       <div>
                         <h3 className="text-xs font-bold text-slate-900">
-                          Clean-Claim Compliance Rate Trend (%)
+                          Clean-Claim Compliance Rate Trend (%) & ±{anomalySigmaThreshold.toFixed(1)}σ Anomaly Overlay
                         </h3>
                         <p className="text-xs text-slate-500">
-                          Percentage of batch claims passing all active NHIS PDF vetting instructions
+                          Shaded corridor shows μ ± {anomalySigmaThreshold.toFixed(1)}σ ({complianceAnomalyStats.lowerThreshold}%–{complianceAnomalyStats.upperThreshold}%); crimson beacons highlight statistical outliers
                         </p>
                       </div>
-                      <span className="text-sm font-bold font-mono tabular-nums text-emerald-700">
-                        {vettedResult.complianceScorePercent}% Current
-                      </span>
+                      <div className="text-right">
+                        <span
+                          className={`text-sm font-bold font-mono tabular-nums ${
+                            vettedResult.complianceScorePercent < complianceAnomalyStats.lowerThreshold
+                              ? 'text-red-700'
+                              : 'text-emerald-700'
+                          }`}
+                        >
+                          {vettedResult.complianceScorePercent}% Current
+                        </span>
+                        <p className="text-[11px] font-mono text-slate-500">
+                          5-Batch Shift: {complianceTrendDelta >= 0 ? `+${complianceTrendDelta}%` : `${complianceTrendDelta}%`}
+                        </p>
+                      </div>
                     </div>
 
                     <div className="h-64 w-full">
                       <ResponsiveContainer width="100%" height="100%">
-                        <AreaChart data={lastFiveBatchesTrend} margin={{ top: 10, right: 16, left: 0, bottom: 0 }}>
+                        <AreaChart data={lastFiveBatchesTrend} margin={{ top: 18, right: 20, left: 0, bottom: 0 }}>
                           <defs>
                             <linearGradient id="complianceGrad" x1="0" y1="0" x2="0" y2="1">
                               <stop offset="5%" stopColor="#0f766e" stopOpacity={0.22} />
@@ -1297,28 +2227,70 @@ export default function App() {
                             axisLine={false}
                             tickLine={false}
                           />
-                          <Tooltip
-                            contentStyle={{
-                              backgroundColor: '#0f172a',
-                              border: 'none',
-                              borderRadius: '8px',
-                              color: '#f8fafc',
-                              fontSize: '12px',
-                              fontFamily: 'JetBrains Mono, monospace',
-                            }}
-                            formatter={(value: any, name: any) => [
-                              `${Number(value).toFixed(1)}%`,
-                              name === 'complianceRate' ? 'Compliance Rate' : name,
-                            ]}
-                          />
+                          <Tooltip content={renderComplianceAnomalyTooltip} />
                           <Legend wrapperStyle={{ fontSize: '11px', paddingTop: '8px' }} />
+
+                          {showAnomalyOverlay && (
+                            <>
+                              {/* Shaded Normal ±kσ Statistical Control Corridor */}
+                              <ReferenceArea
+                                y1={complianceAnomalyStats.lowerThreshold}
+                                y2={complianceAnomalyStats.upperThreshold}
+                                fill="#0d9488"
+                                fillOpacity={0.12}
+                                ifOverflow="extendDomain"
+                              />
+                              {/* Shaded Below-Threshold Low-Compliance Anomaly Zone */}
+                              <ReferenceArea
+                                y1={0}
+                                y2={complianceAnomalyStats.lowerThreshold}
+                                fill="#dc2626"
+                                fillOpacity={0.05}
+                                ifOverflow="extendDomain"
+                              />
+                              {/* Historical Mean (μ) Line */}
+                              <ReferenceLine
+                                y={complianceAnomalyStats.mean}
+                                stroke="#0f766e"
+                                strokeDasharray="3 3"
+                                strokeWidth={1.5}
+                                label={{
+                                  value: `Hist. Mean μ (${complianceAnomalyStats.mean}%)`,
+                                  position: 'insideTopRight',
+                                  fill: '#0f766e',
+                                  fontSize: 10,
+                                }}
+                              />
+                              {/* Lower -kσ Anomaly Threshold Line */}
+                              <ReferenceLine
+                                y={complianceAnomalyStats.lowerThreshold}
+                                stroke="#dc2626"
+                                strokeDasharray="5 3"
+                                strokeWidth={1.5}
+                                label={{
+                                  value: `-${anomalySigmaThreshold.toFixed(1)}σ Anomaly Bound (${complianceAnomalyStats.lowerThreshold}%)`,
+                                  position: 'insideBottomLeft',
+                                  fill: '#dc2626',
+                                  fontSize: 10,
+                                }}
+                              />
+                              {/* Upper +kσ Threshold Line */}
+                              <ReferenceLine
+                                y={complianceAnomalyStats.upperThreshold}
+                                stroke="#0284c7"
+                                strokeDasharray="4 4"
+                                strokeWidth={1}
+                              />
+                            </>
+                          )}
+
                           <ReferenceLine
                             y={75}
                             stroke="#d97706"
                             strokeDasharray="4 4"
                             label={{
                               value: 'NHIA Benchmark (75%)',
-                              position: 'insideTopRight',
+                              position: 'insideBottomRight',
                               fill: '#b45309',
                               fontSize: 10,
                             }}
@@ -1331,7 +2303,8 @@ export default function App() {
                             strokeWidth={2.5}
                             fillOpacity={1}
                             fill="url(#complianceGrad)"
-                            activeDot={{ r: 5, fill: '#0f766e' }}
+                            dot={renderComplianceAnomalyDot}
+                            activeDot={{ r: 6, fill: '#0f172a', stroke: '#ffffff', strokeWidth: 2 }}
                           />
                         </AreaChart>
                       </ResponsiveContainer>
@@ -1410,22 +2383,22 @@ export default function App() {
                   </div>
                 </div>
               ) : (
-                /* Combined Dual-Axis View */
+                /* Combined Dual-Axis View with Anomaly Detection Overlay on Right Y-Axis */
                 <div className="border border-slate-200 rounded-lg p-4 space-y-3">
                   <div className="flex items-center justify-between">
                     <div>
                       <h3 className="text-xs font-bold text-slate-900">
-                        Combined Dual-Axis View: Total Claim Value (GHS) & Compliance Rate (%)
+                        Combined Dual-Axis View: Total Claim Value (GHS) & Compliance Rate (%) with ±{anomalySigmaThreshold.toFixed(1)}σ Anomaly Overlay
                       </h3>
                       <p className="text-xs text-slate-500">
-                        Left axis shows financial claim volume in GHS; right axis tracks batch compliance percentage
+                        Left axis shows financial claim volume in GHS; right axis tracks batch compliance percentage against historical μ ± {anomalySigmaThreshold.toFixed(1)}σ corridor
                       </p>
                     </div>
                   </div>
 
                   <div className="h-72 w-full">
                     <ResponsiveContainer width="100%" height="100%">
-                      <ComposedChart data={lastFiveBatchesTrend} margin={{ top: 10, right: 24, left: 8, bottom: 0 }}>
+                      <ComposedChart data={lastFiveBatchesTrend} margin={{ top: 18, right: 24, left: 8, bottom: 0 }}>
                         <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
                         <XAxis
                           dataKey="period"
@@ -1449,22 +2422,56 @@ export default function App() {
                           axisLine={false}
                           tickLine={false}
                         />
-                        <Tooltip
-                          contentStyle={{
-                            backgroundColor: '#0f172a',
-                            border: 'none',
-                            borderRadius: '8px',
-                            color: '#f8fafc',
-                            fontSize: '12px',
-                            fontFamily: 'JetBrains Mono, monospace',
-                          }}
-                          formatter={(value: any, name: any) =>
-                            String(name).includes('%')
-                              ? [`${Number(value).toFixed(1)}%`, name]
-                              : [`GHS ${Number(value).toFixed(2)}`, name]
-                          }
-                        />
+                        <Tooltip content={renderComplianceAnomalyTooltip} />
                         <Legend wrapperStyle={{ fontSize: '11px', paddingTop: '8px' }} />
+
+                        {showAnomalyOverlay && (
+                          <>
+                            <ReferenceArea
+                              yAxisId="right"
+                              y1={complianceAnomalyStats.lowerThreshold}
+                              y2={complianceAnomalyStats.upperThreshold}
+                              fill="#0d9488"
+                              fillOpacity={0.11}
+                              ifOverflow="extendDomain"
+                            />
+                            <ReferenceArea
+                              yAxisId="right"
+                              y1={0}
+                              y2={complianceAnomalyStats.lowerThreshold}
+                              fill="#dc2626"
+                              fillOpacity={0.05}
+                              ifOverflow="extendDomain"
+                            />
+                            <ReferenceLine
+                              yAxisId="right"
+                              y={complianceAnomalyStats.mean}
+                              stroke="#0f766e"
+                              strokeDasharray="3 3"
+                              strokeWidth={1.5}
+                              label={{
+                                value: `μ = ${complianceAnomalyStats.mean}%`,
+                                position: 'insideTopRight',
+                                fill: '#0f766e',
+                                fontSize: 10,
+                              }}
+                            />
+                            <ReferenceLine
+                              yAxisId="right"
+                              y={complianceAnomalyStats.lowerThreshold}
+                              stroke="#dc2626"
+                              strokeDasharray="5 3"
+                              strokeWidth={1.5}
+                              label={{
+                                value: `-${anomalySigmaThreshold.toFixed(1)}σ (${complianceAnomalyStats.lowerThreshold}%)`,
+                                position: 'insideBottomRight',
+                                fill: '#dc2626',
+                                fontSize: 10,
+                              }}
+                            />
+                          </>
+                        )}
+
                         <Bar
                           yAxisId="left"
                           dataKey="submittedValueGhs"
@@ -1488,7 +2495,8 @@ export default function App() {
                           name="Compliance Rate (%)"
                           stroke="#0f766e"
                           strokeWidth={3}
-                          dot={{ r: 5, fill: '#0f766e' }}
+                          dot={renderComplianceAnomalyDot}
+                          activeDot={{ r: 6, fill: '#0f172a', stroke: '#ffffff', strokeWidth: 2 }}
                         />
                       </ComposedChart>
                     </ResponsiveContainer>
@@ -1496,38 +2504,79 @@ export default function App() {
                 </div>
               )}
 
-              {/* 5-Batch Tabular Ledger Strip */}
-              <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 pt-2">
+              {/* Tabular Batch Ledger Strip with Statistical Z-Score & Anomaly Highlighting */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 pt-2">
                 {lastFiveBatchesTrend.map((b, idx) => {
                   const isCurrent = idx === lastFiveBatchesTrend.length - 1;
+                  const isLowAnomaly = showAnomalyOverlay && b.anomalyType === 'low_outlier';
+                  const isHighAnomaly = showAnomalyOverlay && b.anomalyType === 'high_outlier';
                   return (
                     <div
                       key={b.batchId}
-                      className={`p-3 rounded-lg border text-xs ${
-                        isCurrent ? 'bg-slate-900 text-white border-slate-900' : 'bg-slate-50 border-slate-200 text-slate-800'
+                      className={`p-3 rounded-lg border text-xs transition-colors ${
+                        isCurrent
+                          ? isLowAnomaly
+                            ? 'bg-red-950 text-white border-red-700'
+                            : 'bg-slate-900 text-white border-slate-900'
+                          : isLowAnomaly
+                          ? 'bg-red-50/80 border-red-300 text-slate-900'
+                          : isHighAnomaly
+                          ? 'bg-sky-50/70 border-sky-300 text-slate-900'
+                          : 'bg-slate-50 border-slate-200 text-slate-800'
                       }`}
                     >
-                      <div className="flex items-center justify-between">
-                        <span className="font-semibold">{b.period}</span>
+                      <div className="flex items-center justify-between gap-1">
+                        <span className="font-semibold truncate">{b.period}</span>
                         <span
-                          className={`font-mono font-bold tabular-nums ${
-                            isCurrent ? 'text-emerald-400' : 'text-emerald-700'
+                          className={`font-mono font-bold tabular-nums shrink-0 ${
+                            isCurrent
+                              ? isLowAnomaly
+                                ? 'text-red-300'
+                                : 'text-emerald-400'
+                              : isLowAnomaly
+                              ? 'text-red-700'
+                              : isHighAnomaly
+                              ? 'text-sky-700'
+                              : 'text-emerald-700'
                           }`}
                         >
                           {b.complianceRate.toFixed(1)}%
                         </span>
                       </div>
-                      <p
-                        className={`font-mono text-[11px] truncate mt-0.5 ${
-                          isCurrent ? 'text-slate-300' : 'text-slate-500'
-                        }`}
-                        title={b.batchId}
-                      >
-                        {b.batchId}
-                      </p>
+                      <div className="flex items-center justify-between gap-1 mt-0.5">
+                        <p
+                          className={`font-mono text-[11px] truncate ${
+                            isCurrent ? 'text-slate-300' : 'text-slate-500'
+                          }`}
+                          title={b.batchId}
+                        >
+                          {b.batchId}
+                        </p>
+                        <span
+                          className={`font-mono text-[10px] font-semibold shrink-0 ${
+                            isCurrent
+                              ? isLowAnomaly
+                                ? 'text-red-300'
+                                : 'text-slate-300'
+                              : isLowAnomaly
+                              ? 'text-red-700'
+                              : isHighAnomaly
+                              ? 'text-sky-700'
+                              : 'text-slate-500'
+                          }`}
+                        >
+                          {b.zScore > 0 ? `+${b.zScore}σ` : `${b.zScore}σ`}
+                        </span>
+                      </div>
                       <div
                         className={`flex items-center justify-between mt-2 pt-2 border-t font-mono tabular-nums ${
-                          isCurrent ? 'border-slate-700 text-slate-200' : 'border-slate-200 text-slate-600'
+                          isCurrent
+                            ? isLowAnomaly
+                              ? 'border-red-800 text-red-100'
+                              : 'border-slate-700 text-slate-200'
+                            : isLowAnomaly
+                            ? 'border-red-200 text-slate-700'
+                            : 'border-slate-200 text-slate-600'
                         }`}
                       >
                         <span>GHS {b.submittedValueGhs.toFixed(2)}</span>
@@ -1541,12 +2590,702 @@ export default function App() {
               </div>
             </div>
 
+            {/* Side-by-Side Saved Audit Report Batch Comparison Workbench */}
+            {selectedComparisonReports.reportA && selectedComparisonReports.reportB && (() => {
+              const repA = selectedComparisonReports.reportA;
+              const repB = selectedComparisonReports.reportB;
+
+              const flaggingRateDelta = Number((repB.flaggingRatePct - repA.flaggingRatePct).toFixed(2));
+              const complianceRateDelta = Number((repB.complianceRatePct - repA.complianceRatePct).toFixed(1));
+              const flaggedClaimsDelta = repB.flaggedClaims - repA.flaggedClaims;
+              const totalClaimsDelta = repB.totalClaims - repA.totalClaims;
+
+              const adjTotalDeltaGhs = Number((repB.adjustedTotalGhs - repA.adjustedTotalGhs).toFixed(2));
+              const adjTotalRelPct =
+                repA.adjustedTotalGhs > 0
+                  ? Number((((repB.adjustedTotalGhs - repA.adjustedTotalGhs) / repA.adjustedTotalGhs) * 100).toFixed(1))
+                  : 0;
+              const adjRateDeltaPct = Number((repB.adjustmentRatePct - repA.adjustmentRatePct).toFixed(2));
+
+              const subTotalDeltaGhs = Number((repB.submittedTotalGhs - repA.submittedTotalGhs).toFixed(2));
+              const subTotalRelPct =
+                repA.submittedTotalGhs > 0
+                  ? Number((((repB.submittedTotalGhs - repA.submittedTotalGhs) / repA.submittedTotalGhs) * 100).toFixed(1))
+                  : 0;
+
+              const netDueDeltaGhs = Number((repB.netApprovedGhs - repA.netApprovedGhs).toFixed(2));
+              const netDueRelPct =
+                repA.netApprovedGhs > 0
+                  ? Number((((repB.netApprovedGhs - repA.netApprovedGhs) / repA.netApprovedGhs) * 100).toFixed(1))
+                  : 0;
+
+              const adjServDeltaGhs = Number((repB.adjustedServiceGhs - repA.adjustedServiceGhs).toFixed(2));
+              const adjMedDeltaGhs = Number((repB.adjustedMedicineGhs - repA.adjustedMedicineGhs).toFixed(2));
+              const avgAdjPerFlaggedDelta = Number(
+                (repB.avgAdjustmentPerFlaggedGhs - repA.avgAdjustmentPerFlaggedGhs).toFixed(2)
+              );
+
+              const categories: Array<{
+                key: 'Clinical' | 'Pharmacy' | 'Tariff' | 'Documentation' | 'Membership';
+                label: string;
+                rulesRef: string;
+              }> = [
+                { key: 'Clinical', label: 'Clinical Age & Diagnosis Rules', rulesRef: 'NHIS-R01 to R05' },
+                { key: 'Pharmacy', label: 'Pharmacy & Duplicated Meds Rules', rulesRef: 'NHIS-R07 to R09' },
+                { key: 'Tariff', label: 'G-DRG Tariff & Length-of-Stay Rules', rulesRef: 'NHIS-R06, R12 to R18' },
+                { key: 'Documentation', label: 'Lab & Diagnostic Documentation Rules', rulesRef: 'NHIS-R11, R19' },
+                { key: 'Membership', label: 'NHIS Member Card & Eligibility Rules', rulesRef: 'NHIS-R10' },
+              ];
+
+              return (
+                <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+                  {/* Header & Interactive Report Selectors */}
+                  <div className="p-5 border-b border-slate-200 space-y-4">
+                    <div className="flex flex-wrap items-center justify-between gap-4">
+                      <div>
+                        <h2 className="text-base font-bold text-slate-900">
+                          02. Side-by-Side Batch Comparison (Flagging Rates & Financial Adjustments)
+                        </h2>
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          Select any two audit reports from the saved database (Firestore Cloud, Session Snapshots, or 11-Month Historical Database) to compare claim flagging rates and disallowed financial adjustments.
+                        </p>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          onClick={handleSaveReportToCloud}
+                          className="px-3 py-1.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                          title="Save current XML audit state as a snapshot in the comparison database"
+                        >
+                          <Save className="w-3.5 h-3.5" />
+                          Save Current Batch Snapshot to Compare
+                        </button>
+
+                        {/* Quick Comparison Presets */}
+                        <button
+                          onClick={() => {
+                            setCompareReportAId('hist_NHIS-2025-10 (03-BA-00415)');
+                            setCompareReportBId('hist_NHIS-2026-03 (03-BA-00415)');
+                          }}
+                          className="px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                        >
+                          Worst vs. Best Historical (Oct 25 vs Mar 26)
+                        </button>
+                        <button
+                          onClick={() => {
+                            setCompareReportAId('hist_NHIS-2026-05 (03-BA-00415)');
+                            setCompareReportBId('active_live_xml_batch');
+                          }}
+                          className="px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                        >
+                          May 2026 DB vs. Active XML Batch
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Dual Report Selector Bar */}
+                    <div className="grid grid-cols-1 lg:grid-cols-11 gap-3 items-center bg-slate-50 border border-slate-200 rounded-lg p-3.5">
+                      <div className="lg:col-span-5 space-y-1">
+                        <label
+                          htmlFor="compare-report-a"
+                          className="block text-[11px] font-semibold uppercase tracking-wider text-slate-500"
+                        >
+                          Baseline Audit Report (Report A)
+                        </label>
+                        <select
+                          id="compare-report-a"
+                          value={repA.uid}
+                          onChange={(e) => setCompareReportAId(e.target.value)}
+                          className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-xs font-medium text-slate-900 focus:outline-none focus:border-slate-900"
+                        >
+                          {comparableDatabaseReports.map((r) => (
+                            <option key={`optA_${r.uid}`} value={r.uid}>
+                              {r.displayTitle}
+                            </option>
+                          ))}
+                        </select>
+                        <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-500 font-mono pt-0.5">
+                          <span>Batch: {repA.batchNumber}</span>
+                          <span aria-hidden="true">·</span>
+                          <span>Claims: {repA.totalClaims.toLocaleString()}</span>
+                          <span aria-hidden="true">·</span>
+                          <span>Status: {repA.status.toUpperCase()}</span>
+                        </div>
+                      </div>
+
+                      <div className="lg:col-span-1 flex justify-center">
+                        <button
+                          onClick={() => {
+                            const prevA = repA.uid;
+                            setCompareReportAId(repB.uid);
+                            setCompareReportBId(prevA);
+                          }}
+                          className="p-2 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 transition-colors flex items-center gap-1 text-xs font-medium"
+                          title="Swap Baseline Report A and Target Report B"
+                        >
+                          <ArrowLeftRight className="w-4 h-4" />
+                        </button>
+                      </div>
+
+                      <div className="lg:col-span-5 space-y-1">
+                        <label
+                          htmlFor="compare-report-b"
+                          className="block text-[11px] font-semibold uppercase tracking-wider text-slate-500"
+                        >
+                          Target Comparison Report (Report B)
+                        </label>
+                        <select
+                          id="compare-report-b"
+                          value={repB.uid}
+                          onChange={(e) => setCompareReportBId(e.target.value)}
+                          className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-xs font-medium text-slate-900 focus:outline-none focus:border-slate-900"
+                        >
+                          {comparableDatabaseReports.map((r) => (
+                            <option key={`optB_${r.uid}`} value={r.uid}>
+                              {r.displayTitle}
+                            </option>
+                          ))}
+                        </select>
+                        <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-500 font-mono pt-0.5">
+                          <span>Batch: {repB.batchNumber}</span>
+                          <span aria-hidden="true">·</span>
+                          <span>Claims: {repB.totalClaims.toLocaleString()}</span>
+                          <span aria-hidden="true">·</span>
+                          <span>Status: {repB.status.toUpperCase()}</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Executive Variance Summary KPI Strip */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                      <div className="border border-slate-200 rounded-lg p-3.5 bg-white">
+                        <p className="text-xs text-slate-500 font-medium">Flagging Rate Difference (B vs. A)</p>
+                        <div className="flex items-baseline justify-between gap-2 mt-1">
+                          <span
+                            className={`text-xl font-bold font-mono tabular-nums ${
+                              flaggingRateDelta > 0
+                                ? 'text-red-700'
+                                : flaggingRateDelta < 0
+                                ? 'text-emerald-700'
+                                : 'text-slate-900'
+                            }`}
+                          >
+                            {flaggingRateDelta > 0 ? `+${flaggingRateDelta}%` : `${flaggingRateDelta}%`}
+                          </span>
+                          <span className="text-xs font-mono text-slate-500 tabular-nums">
+                            {repA.flaggingRatePct}% → {repB.flaggingRatePct}%
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 mt-1 font-mono">
+                          {flaggedClaimsDelta >= 0 ? `+${flaggedClaimsDelta}` : flaggedClaimsDelta} flagged claims delta
+                        </p>
+                      </div>
+
+                      <div className="border border-slate-200 rounded-lg p-3.5 bg-white">
+                        <p className="text-xs text-slate-500 font-medium">Financial Adjustment Variance (GHS)</p>
+                        <div className="flex items-baseline justify-between gap-2 mt-1">
+                          <span
+                            className={`text-xl font-bold font-mono tabular-nums ${
+                              adjTotalDeltaGhs > 0
+                                ? 'text-red-700'
+                                : adjTotalDeltaGhs < 0
+                                ? 'text-emerald-700'
+                                : 'text-slate-900'
+                            }`}
+                          >
+                            {adjTotalDeltaGhs >= 0
+                              ? `+GHS ${adjTotalDeltaGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}`
+                              : `-GHS ${Math.abs(adjTotalDeltaGhs).toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 mt-1 font-mono tabular-nums">
+                          Disallowance Rate: {repA.adjustmentRatePct}% → {repB.adjustmentRatePct}% ({adjRateDeltaPct >= 0 ? `+${adjRateDeltaPct}%` : `${adjRateDeltaPct}%`})
+                        </p>
+                      </div>
+
+                      <div className="border border-slate-200 rounded-lg p-3.5 bg-white">
+                        <p className="text-xs text-slate-500 font-medium">Clean-Claim Compliance Shift</p>
+                        <div className="flex items-baseline justify-between gap-2 mt-1">
+                          <span
+                            className={`text-xl font-bold font-mono tabular-nums ${
+                              complianceRateDelta > 0
+                                ? 'text-emerald-700'
+                                : complianceRateDelta < 0
+                                ? 'text-red-700'
+                                : 'text-slate-900'
+                            }`}
+                          >
+                            {complianceRateDelta > 0 ? `+${complianceRateDelta}%` : `${complianceRateDelta}%`}
+                          </span>
+                          <span className="text-xs font-mono text-slate-500 tabular-nums">
+                            {repA.complianceRatePct.toFixed(1)}% → {repB.complianceRatePct.toFixed(1)}%
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 mt-1">
+                          {complianceRateDelta >= 0
+                            ? 'Higher proportion of clean claims in Report B'
+                            : 'Higher proportion of flagged claims in Report B'}
+                        </p>
+                      </div>
+
+                      <div className="border border-slate-200 rounded-lg p-3.5 bg-white">
+                        <p className="text-xs text-slate-500 font-medium">Net Approved Payout Variance</p>
+                        <div className="flex items-baseline justify-between gap-2 mt-1">
+                          <span className="text-xl font-bold font-mono tabular-nums text-slate-900">
+                            {netDueDeltaGhs >= 0
+                              ? `+GHS ${netDueDeltaGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}`
+                              : `-GHS ${Math.abs(netDueDeltaGhs).toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 mt-1 font-mono tabular-nums">
+                          Relative Payout Shift: {netDueRelPct >= 0 ? `+${netDueRelPct}%` : `${netDueRelPct}%`}
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Table Dimension Filter Controls */}
+                    <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                      <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
+                        {(
+                          [
+                            { id: 'all', label: 'All Comparison Dimensions' },
+                            { id: 'flagging', label: 'Flagging Rate & Volume Metrics' },
+                            { id: 'financial', label: 'Financial Adjustments & Payouts' },
+                            { id: 'categories', label: 'Rule Category Breakdown (5 Domains)' },
+                          ] as const
+                        ).map((tab) => (
+                          <button
+                            key={tab.id}
+                            onClick={() => setComparisonMetricFilter(tab.id)}
+                            className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+                              comparisonMetricFilter === tab.id
+                                ? 'bg-white text-slate-900 shadow-sm'
+                                : 'text-slate-600 hover:text-slate-900'
+                            }`}
+                          >
+                            {tab.label}
+                          </button>
+                        ))}
+                      </div>
+
+                      <span className="text-xs text-slate-500 font-mono">
+                        Comparing {repA.shortPeriod} vs. {repB.shortPeriod}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Side-by-Side Comparison Table */}
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse text-xs">
+                      <thead>
+                        <tr className="bg-slate-900 text-white font-semibold">
+                          <th className="py-3 px-4">Audit Dimension / Vetting Metric</th>
+                          <th className="py-3 px-4 text-right">
+                            <div>Report A: {repA.shortPeriod}</div>
+                            <div className="text-[10px] font-mono font-normal text-slate-300 truncate max-w-[180px] ml-auto">
+                              {repA.batchNumber}
+                            </div>
+                          </th>
+                          <th className="py-3 px-4 text-right">
+                            <div>Report B: {repB.shortPeriod}</div>
+                            <div className="text-[10px] font-mono font-normal text-slate-300 truncate max-w-[180px] ml-auto">
+                              {repB.batchNumber}
+                            </div>
+                          </th>
+                          <th className="py-3 px-4 text-right">Absolute Difference (B − A)</th>
+                          <th className="py-3 px-4 text-right">Variance & Audit Impact</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-200 font-mono tabular-nums">
+                        {/* SECTION 1: FLAGGING RATES & CLAIMS VOLUME */}
+                        {(comparisonMetricFilter === 'all' || comparisonMetricFilter === 'flagging') && (
+                          <>
+                            <tr className="bg-slate-100/80 font-sans font-bold text-slate-800">
+                              <td colSpan={5} className="py-2 px-4 text-[11px] uppercase tracking-wider">
+                                Part I · Claims Volume & Discrepancy Flagging Rates
+                              </td>
+                            </tr>
+                            <tr className="hover:bg-slate-50">
+                              <td className="py-2.5 px-4 font-sans font-medium text-slate-900">
+                                Total Audited Claims Volume (Attendances)
+                              </td>
+                              <td className="py-2.5 px-4 text-right">{repA.totalClaims.toLocaleString()}</td>
+                              <td className="py-2.5 px-4 text-right">{repB.totalClaims.toLocaleString()}</td>
+                              <td className="py-2.5 px-4 text-right">
+                                {totalClaimsDelta >= 0 ? `+${totalClaimsDelta.toLocaleString()}` : totalClaimsDelta.toLocaleString()}
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-sans text-slate-600">
+                                {repA.totalClaims > 0
+                                  ? `${(((repB.totalClaims - repA.totalClaims) / repA.totalClaims) * 100).toFixed(1)}% volume shift`
+                                  : 'Baseline'}
+                              </td>
+                            </tr>
+
+                            <tr className="hover:bg-slate-50">
+                              <td className="py-2.5 px-4 font-sans font-medium text-slate-900">
+                                Flagged Claims Count (Discrepancy Claims)
+                              </td>
+                              <td className="py-2.5 px-4 text-right text-red-700 font-semibold">
+                                {repA.flaggedClaims.toLocaleString()}
+                              </td>
+                              <td className="py-2.5 px-4 text-right text-red-700 font-semibold">
+                                {repB.flaggedClaims.toLocaleString()}
+                              </td>
+                              <td
+                                className={`py-2.5 px-4 text-right font-bold ${
+                                  flaggedClaimsDelta > 0
+                                    ? 'text-red-700'
+                                    : flaggedClaimsDelta < 0
+                                    ? 'text-emerald-700'
+                                    : 'text-slate-700'
+                                }`}
+                              >
+                                {flaggedClaimsDelta >= 0 ? `+${flaggedClaimsDelta.toLocaleString()}` : flaggedClaimsDelta.toLocaleString()}
+                              </td>
+                              <td
+                                className={`py-2.5 px-4 text-right font-sans font-semibold ${
+                                  flaggedClaimsDelta > 0
+                                    ? 'text-red-700'
+                                    : flaggedClaimsDelta < 0
+                                    ? 'text-emerald-700'
+                                    : 'text-slate-600'
+                                }`}
+                              >
+                                {flaggedClaimsDelta > 0
+                                  ? 'Higher Flagged Volume'
+                                  : flaggedClaimsDelta < 0
+                                  ? 'Reduced Flagged Volume'
+                                  : 'Unchanged'}
+                              </td>
+                            </tr>
+
+                            <tr className="bg-amber-50/40 hover:bg-amber-50/70">
+                              <td className="py-2.5 px-4 font-sans font-bold text-slate-900">
+                                Batch Claim Flagging Rate (Flagged / Total %)
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-bold text-red-700">
+                                {repA.flaggingRatePct.toFixed(2)}%
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-bold text-red-700">
+                                {repB.flaggingRatePct.toFixed(2)}%
+                              </td>
+                              <td
+                                className={`py-2.5 px-4 text-right font-bold ${
+                                  flaggingRateDelta > 0
+                                    ? 'text-red-700'
+                                    : flaggingRateDelta < 0
+                                    ? 'text-emerald-700'
+                                    : 'text-slate-800'
+                                }`}
+                              >
+                                {flaggingRateDelta >= 0 ? `+${flaggingRateDelta.toFixed(2)}%` : `${flaggingRateDelta.toFixed(2)}%`}
+                              </td>
+                              <td
+                                className={`py-2.5 px-4 text-right font-sans font-bold ${
+                                  flaggingRateDelta > 0
+                                    ? 'text-red-700'
+                                    : flaggingRateDelta < 0
+                                    ? 'text-emerald-700'
+                                    : 'text-slate-600'
+                                }`}
+                              >
+                                {flaggingRateDelta > 0
+                                  ? `Flagging Rate Increased (+${flaggingRateDelta.toFixed(2)} pts)`
+                                  : flaggingRateDelta < 0
+                                  ? `Flagging Rate Improved (${flaggingRateDelta.toFixed(2)} pts)`
+                                  : 'Identical Flagging Rate'}
+                              </td>
+                            </tr>
+
+                            <tr className="hover:bg-slate-50">
+                              <td className="py-2.5 px-4 font-sans font-semibold text-slate-900">
+                                Clean-Claim Compliance Rate (%)
+                              </td>
+                              <td className="py-2.5 px-4 text-right text-emerald-700 font-bold">
+                                {repA.complianceRatePct.toFixed(1)}%
+                              </td>
+                              <td className="py-2.5 px-4 text-right text-emerald-700 font-bold">
+                                {repB.complianceRatePct.toFixed(1)}%
+                              </td>
+                              <td
+                                className={`py-2.5 px-4 text-right font-bold ${
+                                  complianceRateDelta > 0
+                                    ? 'text-emerald-700'
+                                    : complianceRateDelta < 0
+                                    ? 'text-red-700'
+                                    : 'text-slate-700'
+                                }`}
+                              >
+                                {complianceRateDelta >= 0 ? `+${complianceRateDelta.toFixed(1)}%` : `${complianceRateDelta.toFixed(1)}%`}
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-sans text-slate-600">
+                                {repB.cleanClaims.toLocaleString()} vs {repA.cleanClaims.toLocaleString()} clean claims
+                              </td>
+                            </tr>
+
+                            <tr className="hover:bg-slate-50">
+                              <td className="py-2.5 px-4 font-sans font-medium text-slate-900">
+                                Distinct NHIS Vetting Rules Triggered (of 19)
+                              </td>
+                              <td className="py-2.5 px-4 text-right">{repA.rulesTriggeredCount} / 19</td>
+                              <td className="py-2.5 px-4 text-right">{repB.rulesTriggeredCount} / 19</td>
+                              <td className="py-2.5 px-4 text-right">
+                                {repB.rulesTriggeredCount - repA.rulesTriggeredCount >= 0
+                                  ? `+${repB.rulesTriggeredCount - repA.rulesTriggeredCount}`
+                                  : repB.rulesTriggeredCount - repA.rulesTriggeredCount}{' '}
+                                rules
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-sans text-slate-600">
+                                {repB.criticalAlertsCount} vs {repA.criticalAlertsCount} critical/high alerts
+                              </td>
+                            </tr>
+                          </>
+                        )}
+
+                        {/* SECTION 2: FINANCIAL ADJUSTMENTS & PAYOUTS */}
+                        {(comparisonMetricFilter === 'all' || comparisonMetricFilter === 'financial') && (
+                          <>
+                            <tr className="bg-slate-100/80 font-sans font-bold text-slate-800">
+                              <td colSpan={5} className="py-2 px-4 text-[11px] uppercase tracking-wider">
+                                Part II · Submitted Claim Values & Disallowed Financial Adjustments (GHS)
+                              </td>
+                            </tr>
+
+                            <tr className="hover:bg-slate-50">
+                              <td className="py-2.5 px-4 font-sans font-medium text-slate-900">
+                                Total Submitted Claim Value (GHS)
+                              </td>
+                              <td className="py-2.5 px-4 text-right">
+                                GHS {repA.submittedTotalGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                              </td>
+                              <td className="py-2.5 px-4 text-right">
+                                GHS {repB.submittedTotalGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                              </td>
+                              <td className="py-2.5 px-4 text-right">
+                                {subTotalDeltaGhs >= 0
+                                  ? `+GHS ${subTotalDeltaGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}`
+                                  : `-GHS ${Math.abs(subTotalDeltaGhs).toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-sans text-slate-600">
+                                {subTotalRelPct >= 0 ? `+${subTotalRelPct}%` : `${subTotalRelPct}%`} submitted value shift
+                              </td>
+                            </tr>
+
+                            <tr className="bg-red-50/40 hover:bg-red-50/70">
+                              <td className="py-2.5 px-4 font-sans font-bold text-slate-900">
+                                Total Disallowed Financial Adjustments (GHS)
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-bold text-red-700">
+                                GHS {repA.adjustedTotalGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-bold text-red-700">
+                                GHS {repB.adjustedTotalGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                              </td>
+                              <td
+                                className={`py-2.5 px-4 text-right font-bold ${
+                                  adjTotalDeltaGhs > 0
+                                    ? 'text-red-700'
+                                    : adjTotalDeltaGhs < 0
+                                    ? 'text-emerald-700'
+                                    : 'text-slate-800'
+                                }`}
+                              >
+                                {adjTotalDeltaGhs >= 0
+                                  ? `+GHS ${adjTotalDeltaGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}`
+                                  : `-GHS ${Math.abs(adjTotalDeltaGhs).toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+                              </td>
+                              <td
+                                className={`py-2.5 px-4 text-right font-sans font-bold ${
+                                  adjTotalDeltaGhs > 0
+                                    ? 'text-red-700'
+                                    : adjTotalDeltaGhs < 0
+                                    ? 'text-emerald-700'
+                                    : 'text-slate-600'
+                                }`}
+                              >
+                                {adjTotalDeltaGhs > 0
+                                  ? `+${adjTotalRelPct}% Higher Financial Disallowance`
+                                  : adjTotalDeltaGhs < 0
+                                  ? `${adjTotalRelPct}% Lower Financial Disallowance`
+                                  : 'Identical Adjustment Total'}
+                              </td>
+                            </tr>
+
+                            <tr className="hover:bg-slate-50">
+                              <td className="py-2.5 px-4 font-sans font-medium text-slate-800 pl-7">
+                                ↳ Disallowed Service / G-DRG Tariff Adjustments (GHS)
+                              </td>
+                              <td className="py-2.5 px-4 text-right text-red-700">
+                                GHS {repA.adjustedServiceGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                              </td>
+                              <td className="py-2.5 px-4 text-right text-red-700">
+                                GHS {repB.adjustedServiceGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                              </td>
+                              <td
+                                className={`py-2.5 px-4 text-right font-semibold ${
+                                  adjServDeltaGhs > 0 ? 'text-red-700' : adjServDeltaGhs < 0 ? 'text-emerald-700' : 'text-slate-700'
+                                }`}
+                              >
+                                {adjServDeltaGhs >= 0
+                                  ? `+GHS ${adjServDeltaGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}`
+                                  : `-GHS ${Math.abs(adjServDeltaGhs).toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-sans text-slate-600">
+                                Service tariff deductions
+                              </td>
+                            </tr>
+
+                            <tr className="hover:bg-slate-50">
+                              <td className="py-2.5 px-4 font-sans font-medium text-slate-800 pl-7">
+                                ↳ Disallowed Medicine / Pharmacy Adjustments (GHS)
+                              </td>
+                              <td className="py-2.5 px-4 text-right text-red-700">
+                                GHS {repA.adjustedMedicineGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                              </td>
+                              <td className="py-2.5 px-4 text-right text-red-700">
+                                GHS {repB.adjustedMedicineGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                              </td>
+                              <td
+                                className={`py-2.5 px-4 text-right font-semibold ${
+                                  adjMedDeltaGhs > 0 ? 'text-red-700' : adjMedDeltaGhs < 0 ? 'text-emerald-700' : 'text-slate-700'
+                                }`}
+                              >
+                                {adjMedDeltaGhs >= 0
+                                  ? `+GHS ${adjMedDeltaGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}`
+                                  : `-GHS ${Math.abs(adjMedDeltaGhs).toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-sans text-slate-600">
+                                Pharmacy & quantity deductions
+                              </td>
+                            </tr>
+
+                            <tr className="bg-amber-50/40 hover:bg-amber-50/70">
+                              <td className="py-2.5 px-4 font-sans font-bold text-slate-900">
+                                Financial Disallowance Ratio (Adjusted / Submitted %)
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-bold text-red-700">
+                                {repA.adjustmentRatePct.toFixed(2)}%
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-bold text-red-700">
+                                {repB.adjustmentRatePct.toFixed(2)}%
+                              </td>
+                              <td
+                                className={`py-2.5 px-4 text-right font-bold ${
+                                  adjRateDeltaPct > 0
+                                    ? 'text-red-700'
+                                    : adjRateDeltaPct < 0
+                                    ? 'text-emerald-700'
+                                    : 'text-slate-800'
+                                }`}
+                              >
+                                {adjRateDeltaPct >= 0 ? `+${adjRateDeltaPct.toFixed(2)}%` : `${adjRateDeltaPct.toFixed(2)}%`}
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-sans text-slate-700">
+                                Mean GHS {repB.avgAdjustmentPerFlaggedGhs.toFixed(2)} vs GHS {repA.avgAdjustmentPerFlaggedGhs.toFixed(2)} / flagged claim ({avgAdjPerFlaggedDelta >= 0 ? `+${avgAdjPerFlaggedDelta.toFixed(2)}` : avgAdjPerFlaggedDelta.toFixed(2)})
+                              </td>
+                            </tr>
+
+                            <tr className="hover:bg-slate-50">
+                              <td className="py-2.5 px-4 font-sans font-bold text-emerald-900">
+                                Net Approved Amount Due After Vetting (GHS)
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-bold text-emerald-700">
+                                GHS {repA.netApprovedGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-bold text-emerald-700">
+                                GHS {repB.netApprovedGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-bold text-slate-900">
+                                {netDueDeltaGhs >= 0
+                                  ? `+GHS ${netDueDeltaGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}`
+                                  : `-GHS ${Math.abs(netDueDeltaGhs).toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-sans text-emerald-800 font-semibold">
+                                {netDueRelPct >= 0 ? `+${netDueRelPct}%` : `${netDueRelPct}%`} net approved payout
+                              </td>
+                            </tr>
+                          </>
+                        )}
+
+                        {/* SECTION 3: RULE CATEGORY FLAGGING & ADJUSTMENT BREAKDOWN */}
+                        {(comparisonMetricFilter === 'all' || comparisonMetricFilter === 'categories') && (
+                          <>
+                            <tr className="bg-slate-100/80 font-sans font-bold text-slate-800">
+                              <td colSpan={5} className="py-2 px-4 text-[11px] uppercase tracking-wider">
+                                Part III · NHIS Rule Category Breakdown (Flagged Claims & Financial Adjustments by Domain)
+                              </td>
+                            </tr>
+                            {categories.map((cat) => {
+                              const catA = repA.categoryBreakdown[cat.key];
+                              const catB = repB.categoryBreakdown[cat.key];
+                              const rateA = Number(((catA.flaggedCount / Math.max(1, repA.totalClaims)) * 100).toFixed(2));
+                              const rateB = Number(((catB.flaggedCount / Math.max(1, repB.totalClaims)) * 100).toFixed(2));
+                              const rateDiff = Number((rateB - rateA).toFixed(2));
+                              const ghsDiff = Number((catB.adjustedGhs - catA.adjustedGhs).toFixed(2));
+
+                              return (
+                                <tr key={cat.key} className="hover:bg-slate-50">
+                                  <td className="py-2.5 px-4 font-sans">
+                                    <div className="font-semibold text-slate-900">{cat.label}</div>
+                                    <div className="text-[11px] text-slate-500 font-mono">{cat.rulesRef}</div>
+                                  </td>
+                                  <td className="py-2.5 px-4 text-right">
+                                    <div className="font-semibold text-slate-900">
+                                      {catA.flaggedCount} claims ({rateA}%)
+                                    </div>
+                                    <div className="text-[11px] text-red-700">
+                                      GHS {catA.adjustedGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                                    </div>
+                                  </td>
+                                  <td className="py-2.5 px-4 text-right">
+                                    <div className="font-semibold text-slate-900">
+                                      {catB.flaggedCount} claims ({rateB}%)
+                                    </div>
+                                    <div className="text-[11px] text-red-700">
+                                      GHS {catB.adjustedGhs.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                                    </div>
+                                  </td>
+                                  <td
+                                    className={`py-2.5 px-4 text-right font-semibold ${
+                                      ghsDiff > 0 ? 'text-red-700' : ghsDiff < 0 ? 'text-emerald-700' : 'text-slate-700'
+                                    }`}
+                                  >
+                                    <div>{rateDiff >= 0 ? `+${rateDiff.toFixed(2)}% rate` : `${rateDiff.toFixed(2)}% rate`}</div>
+                                    <div className="text-[11px]">
+                                      {ghsDiff >= 0
+                                        ? `+GHS ${ghsDiff.toLocaleString('en-US', { minimumFractionDigits: 2 })}`
+                                        : `-GHS ${Math.abs(ghsDiff).toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+                                    </div>
+                                  </td>
+                                  <td
+                                    className={`py-2.5 px-4 text-right font-sans font-medium ${
+                                      ghsDiff > 0 ? 'text-red-700' : ghsDiff < 0 ? 'text-emerald-700' : 'text-slate-600'
+                                    }`}
+                                  >
+                                    {ghsDiff > 0
+                                      ? 'Elevated Category Disallowance'
+                                      : ghsDiff < 0
+                                      ? 'Reduced Category Disallowance'
+                                      : 'Stable Category Impact'}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              );
+            })()}
+
             {/* Official NHIS Claims Vetting Summary Sheet */}
             <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
               <div className="px-5 py-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-4">
                 <div>
                   <h2 className="text-base font-bold text-slate-900">
-                    02. Claims Vetting Summary Sheet (XML Batch Execution)
+                    03. Claims Vetting Summary Sheet (XML Batch Execution)
                   </h2>
                   <p className="text-xs text-slate-500 mt-0.5">
                     Structured by Specialty across Out-Patient and In-Patient submissions, adjustments, and net amount due.
@@ -1650,17 +3389,27 @@ export default function App() {
                       </div>
                     </div>
 
-                    <button
-                      onClick={() => {
-                        setSelectedRuleFilter(rb.ruleCode);
-                        setClaimStatusFilter('flagged');
-                        setActiveTab('claims');
-                      }}
-                      className="text-xs font-semibold text-slate-700 hover:text-slate-900 flex items-center gap-1"
-                    >
-                      <span>Inspect in Claims Auditor</span>
-                      <ChevronRight className="w-3.5 h-3.5" />
-                    </button>
+                    <div className="flex items-center gap-3">
+                      <button
+                        onClick={() => handleFixRuleDiscrepancies(rb.ruleCode)}
+                        className="px-3 py-1.5 text-xs font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg transition-colors flex items-center gap-1.5 whitespace-nowrap"
+                      >
+                        <Wrench className="w-3.5 h-3.5" />
+                        <span>Auto-Fix All {rb.ruleCode} ({rb.affectedClaimsCount})</span>
+                      </button>
+
+                      <button
+                        onClick={() => {
+                          setSelectedRuleFilter(rb.ruleCode);
+                          setClaimStatusFilter('flagged');
+                          setActiveTab('claims');
+                        }}
+                        className="text-xs font-semibold text-slate-700 hover:text-slate-900 flex items-center gap-1"
+                      >
+                        <span>Inspect in Claims Auditor</span>
+                        <ChevronRight className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
                   </div>
 
                   <div className="overflow-x-auto">
@@ -1673,7 +3422,8 @@ export default function App() {
                           <th className="py-2 px-3">Folder No.</th>
                           <th className="py-2 px-3">Attendance Date</th>
                           <th className="py-2 px-4">Specific Discrepancy Finding</th>
-                          <th className="py-2 px-4 text-right">Adjustment (GHS)</th>
+                          <th className="py-2 px-3 text-right">Adjustment (GHS)</th>
+                          <th className="py-2 px-4 text-right">Remediate</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100">
@@ -1686,7 +3436,11 @@ export default function App() {
                               <button
                                 onClick={() => {
                                   const found = vettedResult.claims.find((c) => c.claimId === d.claimId);
-                                  if (found) setInspectedClaim(found);
+                                  if (found) {
+                                    setInspectedClaim(found);
+                                    setEditableClaim(JSON.parse(JSON.stringify(found)));
+                                    setIsEditingClaimXml(false);
+                                  }
                                 }}
                                 className="text-slate-900 underline hover:text-emerald-700"
                               >
@@ -1697,8 +3451,16 @@ export default function App() {
                             <td className="py-2 px-3 font-mono">{d.hospitalRecordNumber}</td>
                             <td className="py-2 px-3 font-mono">{d.attendanceDate}</td>
                             <td className="py-2 px-4 text-slate-700">{d.specificFinding}</td>
-                            <td className="py-2 px-4 text-right font-mono tabular-nums font-semibold text-red-700">
+                            <td className="py-2 px-3 text-right font-mono tabular-nums font-semibold text-red-700">
                               {d.financialAdjustmentGhs.toFixed(2)}
+                            </td>
+                            <td className="py-2 px-4 text-right">
+                              <button
+                                onClick={() => handleFixSingleDiscrepancy(d)}
+                                className="px-2.5 py-1 text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded transition-colors whitespace-nowrap"
+                              >
+                                Fix in XML
+                              </button>
                             </td>
                           </tr>
                         ))}
@@ -2118,12 +3880,27 @@ export default function App() {
                               )}
                             </td>
                             <td className="py-2.5 px-4 text-right">
-                              <button
-                                onClick={() => setInspectedClaim(claim)}
-                                className="px-2.5 py-1 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded transition-colors whitespace-nowrap"
-                              >
-                                Inspect XML
-                              </button>
+                              <div className="flex items-center justify-end gap-1.5">
+                                {claimDiscs.length > 0 && (
+                                  <button
+                                    onClick={() => handleFixSingleClaim(claim.claimId)}
+                                    className="px-2.5 py-1 text-xs font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded transition-colors whitespace-nowrap flex items-center gap-1"
+                                  >
+                                    <Wrench className="w-3 h-3" />
+                                    Fix Claim
+                                  </button>
+                                )}
+                                <button
+                                  onClick={() => {
+                                    setInspectedClaim(claim);
+                                    setEditableClaim(JSON.parse(JSON.stringify(claim)));
+                                    setIsEditingClaimXml(false);
+                                  }}
+                                  className="px-2.5 py-1 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded transition-colors whitespace-nowrap"
+                                >
+                                  Inspect / Edit XML
+                                </button>
+                              </div>
                             </td>
                           </tr>
                         );
@@ -2389,14 +4166,14 @@ export default function App() {
         )}
       </main>
 
-      {/* Modal: Inspect Individual Claim XML & AI Remediation */}
+      {/* Modal: Inspect & Remediate Individual Claim XML */}
       {inspectedClaim && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 flex items-center justify-center p-4 overflow-y-auto">
-          <div className="bg-white border border-slate-200 rounded-xl max-w-4xl w-full max-h-[90vh] flex flex-col overflow-hidden shadow-xl">
-            <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between bg-slate-50">
+          <div className="bg-white border border-slate-200 rounded-xl max-w-5xl w-full max-h-[92vh] flex flex-col overflow-hidden shadow-xl">
+            <div className="px-6 py-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3 bg-slate-50">
               <div>
                 <h3 className="text-base font-bold text-slate-900">
-                  Claim Audit Inspector · <span className="font-mono">{inspectedClaim.claimId}</span>
+                  Claim Audit & XML Remediation Inspector · <span className="font-mono">{inspectedClaim.claimId}</span>
                 </h3>
                 <p className="text-xs text-slate-500">
                   Patient: {maskPhi ? inspectedClaim.initials : inspectedClaim.fullName} · NHIS No:{' '}
@@ -2405,15 +4182,51 @@ export default function App() {
                   {inspectedClaim.ageYears} yrs ({inspectedClaim.gender})
                 </p>
               </div>
-              <button
-                onClick={() => {
-                  setInspectedClaim(null);
-                  setRemediationData(null);
-                }}
-                className="px-3 py-1.5 text-xs font-semibold text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-100"
-              >
-                Close
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                {(discrepanciesByClaim.get(inspectedClaim.claimId) || []).length > 0 && (
+                  <button
+                    onClick={() => handleFixSingleClaim(inspectedClaim.claimId)}
+                    className="px-3 py-1.5 text-xs font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg transition-colors flex items-center gap-1.5"
+                  >
+                    <Wrench className="w-3.5 h-3.5" />
+                    Auto-Fix All Issues on Claim
+                  </button>
+                )}
+                <button
+                  onClick={() => {
+                    if (!isEditingClaimXml) {
+                      setEditableClaim(JSON.parse(JSON.stringify(inspectedClaim)));
+                    }
+                    setIsEditingClaimXml((prev) => !prev);
+                  }}
+                  className={`px-3 py-1.5 text-xs font-semibold rounded-lg border transition-colors flex items-center gap-1.5 ${
+                    isEditingClaimXml
+                      ? 'bg-slate-900 text-white border-slate-900'
+                      : 'bg-white text-slate-800 border-slate-300 hover:bg-slate-100'
+                  }`}
+                >
+                  <Edit3 className="w-3.5 h-3.5" />
+                  {isEditingClaimXml ? 'Exit XML Editor' : 'Manual XML Editor'}
+                </button>
+                <button
+                  onClick={handleDownloadFixedXml}
+                  className="px-3 py-1.5 text-xs font-semibold text-emerald-900 bg-emerald-50 border border-emerald-300 hover:bg-emerald-100 rounded-lg transition-colors flex items-center gap-1.5"
+                >
+                  <FileCode className="w-3.5 h-3.5" />
+                  Download Fixed XML
+                </button>
+                <button
+                  onClick={() => {
+                    setInspectedClaim(null);
+                    setEditableClaim(null);
+                    setIsEditingClaimXml(false);
+                    setRemediationData(null);
+                  }}
+                  className="px-3 py-1.5 text-xs font-semibold text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-100"
+                >
+                  Close
+                </button>
+              </div>
             </div>
 
             <div className="p-6 overflow-y-auto space-y-5 text-xs">
@@ -2422,7 +4235,7 @@ export default function App() {
                 const claimDiscs = discrepanciesByClaim.get(inspectedClaim.claimId) || [];
                 return (
                   <div className="space-y-3">
-                    <div className="flex items-center justify-between">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
                       <h4 className="font-bold text-slate-900 text-sm">
                         Vetting Findings ({claimDiscs.length})
                       </h4>
@@ -2440,22 +4253,34 @@ export default function App() {
                     </div>
 
                     {claimDiscs.length === 0 ? (
-                      <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg text-emerald-900">
-                        This claim passed all 15 NHIS PDF vetting instructions with zero adjustments.
+                      <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-lg text-emerald-900 flex items-center justify-between">
+                        <span className="font-medium">
+                          This claim passes all {rules.length} NHIS vetting instructions with zero adjustments.
+                        </span>
+                        <span className="font-mono font-bold text-emerald-800">COMPLIANT</span>
                       </div>
                     ) : (
                       <div className="space-y-2">
                         {claimDiscs.map((d) => (
-                          <div key={d.id} className="p-3.5 bg-red-50/70 border border-red-200 rounded-lg space-y-1">
-                            <div className="flex items-center justify-between font-semibold text-red-900">
+                          <div key={d.id} className="p-3.5 bg-red-50/70 border border-red-200 rounded-lg space-y-1.5">
+                            <div className="flex flex-wrap items-center justify-between gap-2 font-semibold text-red-900">
                               <span>
                                 {d.ruleCode} — {d.ruleTitle} ({d.adjustmentType})
                               </span>
-                              <span className="font-mono">-GHS {d.financialAdjustmentGhs.toFixed(2)}</span>
+                              <div className="flex items-center gap-3">
+                                <span className="font-mono">-GHS {d.financialAdjustmentGhs.toFixed(2)}</span>
+                                <button
+                                  onClick={() => handleFixSingleDiscrepancy(d)}
+                                  className="px-2.5 py-1 text-xs font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded transition-colors flex items-center gap-1"
+                                >
+                                  <Wrench className="w-3 h-3" />
+                                  Fix This Issue in XML
+                                </button>
+                              </div>
                             </div>
                             <p className="text-slate-800">{d.specificFinding}</p>
                             <p className="text-slate-600 font-mono">{d.evidenceDetail}</p>
-                            <p className="text-emerald-900 font-medium pt-1">
+                            <p className="text-emerald-900 font-medium pt-0.5">
                               Auditor Action: {d.recommendedAction}
                             </p>
                           </div>
@@ -2491,69 +4316,377 @@ export default function App() {
                 );
               })()}
 
-              {/* Treatments & Diagnoses */}
-              <div>
-                <h4 className="font-bold text-slate-900 text-sm mb-2">
-                  Billed Treatments, Procedures & ICD-10 Diagnoses ({inspectedClaim.treatments.length})
-                </h4>
-                <table className="w-full text-left border border-slate-200 rounded-lg overflow-hidden">
-                  <thead className="bg-slate-100 border-b border-slate-200">
-                    <tr>
-                      <th className="py-2 px-3">Type</th>
-                      <th className="py-2 px-3">G-DRG Treatment Code</th>
-                      <th className="py-2 px-3">ICD-10 Code & Description</th>
-                      <th className="py-2 px-3 text-right">Tariff (GHC)</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-200 font-mono">
-                    {inspectedClaim.treatments.map((t, i) => (
-                      <tr key={i}>
-                        <td className="py-2 px-3 font-sans">{t.type}</td>
-                        <td className="py-2 px-3 font-semibold">{t.treatmentCode}</td>
-                        <td className="py-2 px-3 font-sans">{t.icdCode || '—'}</td>
-                        <td className="py-2 px-3 text-right">{t.tariff.toFixed(2)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+              {/* Interactive Manual XML Editor Mode vs Read-Only Inspector Mode */}
+              {isEditingClaimXml && editableClaim ? (
+                <div className="bg-slate-50 border border-slate-300 rounded-xl p-4 space-y-4">
+                  <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+                    <div>
+                      <h4 className="font-bold text-slate-900 text-sm">
+                        Interactive XML Claim Editor ({editableClaim.claimId})
+                      </h4>
+                      <p className="text-xs text-slate-500">
+                        Modify XML tags, G-DRG codes, referrals, diagnoses, or medicine quantities below and save directly to the batch XML.
+                      </p>
+                    </div>
+                    <button
+                      onClick={handleSaveManualClaimEdits}
+                      className="px-4 py-2 text-xs font-bold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg transition-colors flex items-center gap-1.5"
+                    >
+                      <Save className="w-3.5 h-3.5" />
+                      Save Changes to XML
+                    </button>
+                  </div>
 
-              {/* Dispensed Medicines */}
-              <div>
-                <h4 className="font-bold text-slate-900 text-sm mb-2">
-                  Dispensed Medicines & Prescriptions ({inspectedClaim.medicines.length})
-                </h4>
-                {inspectedClaim.medicines.length === 0 ? (
-                  <p className="text-slate-500">No medicines billed on this claim.</p>
-                ) : (
-                  <table className="w-full text-left border border-slate-200 rounded-lg overflow-hidden">
-                    <thead className="bg-slate-100 border-b border-slate-200">
-                      <tr>
-                        <th className="py-2 px-3">Medicine Code</th>
-                        <th className="py-2 px-3">Date</th>
-                        <th className="py-2 px-3">Prescription Regimen</th>
-                        <th className="py-2 px-3 text-right">Dispensed Qty</th>
-                        <th className="py-2 px-3 text-right">Unit Price</th>
-                        <th className="py-2 px-3 text-right">Total (GHC)</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-200 font-mono">
-                      {inspectedClaim.medicines.map((m, i) => (
-                        <tr key={i}>
-                          <td className="py-2 px-3 font-semibold">{m.medicineCode}</td>
-                          <td className="py-2 px-3">{m.medicineDate}</td>
-                          <td className="py-2 px-3 font-sans">
-                            {m.dose} × {m.frequency}/day for {m.duration}d
-                          </td>
-                          <td className="py-2 px-3 text-right">{m.quantity}</td>
-                          <td className="py-2 px-3 text-right">{m.unitPrice.toFixed(2)}</td>
-                          <td className="py-2 px-3 text-right font-semibold">{m.medicineTotal.toFixed(2)}</td>
-                        </tr>
+                  {/* Core XML Metadata Fields */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <div>
+                      <label className="block font-semibold text-slate-700 mb-1">NHIS MemberNumber</label>
+                      <input
+                        type="text"
+                        value={editableClaim.memberNumber}
+                        onChange={(e) => setEditableClaim({ ...editableClaim, memberNumber: e.target.value })}
+                        className="w-full border border-slate-300 rounded px-2.5 py-1.5 font-mono bg-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-semibold text-slate-700 mb-1">ServiceType (INP / OUT)</label>
+                      <select
+                        value={editableClaim.serviceType}
+                        onChange={(e) => setEditableClaim({ ...editableClaim, serviceType: e.target.value })}
+                        className="w-full border border-slate-300 rounded px-2.5 py-1.5 font-mono bg-white"
+                      >
+                        <option value="OUT">OUT (Out-Patient)</option>
+                        <option value="INP">INP (In-Patient)</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block font-semibold text-slate-700 mb-1">
+                        {editableClaim.serviceType === 'INP' ? 'InPatientCode (G-DRG)' : 'OutPatientCode (G-DRG)'}
+                      </label>
+                      <input
+                        type="text"
+                        value={
+                          editableClaim.serviceType === 'INP'
+                            ? editableClaim.inPatientCode
+                            : editableClaim.outPatientCode
+                        }
+                        onChange={(e) =>
+                          editableClaim.serviceType === 'INP'
+                            ? setEditableClaim({ ...editableClaim, inPatientCode: e.target.value })
+                            : setEditableClaim({ ...editableClaim, outPatientCode: e.target.value })
+                        }
+                        className="w-full border border-slate-300 rounded px-2.5 py-1.5 font-mono bg-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-semibold text-slate-700 mb-1">Service Tariff (GHS)</label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={editableClaim.totalServiceCost}
+                        onChange={(e) =>
+                          setEditableClaim({ ...editableClaim, totalServiceCost: parseFloat(e.target.value) || 0 })
+                        }
+                        className="w-full border border-slate-300 rounded px-2.5 py-1.5 font-mono bg-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-semibold text-slate-700 mb-1">ReferralNo / Attachment</label>
+                      <input
+                        type="text"
+                        placeholder="e.g. PHYSIO-REQ-2026"
+                        value={editableClaim.referralNo}
+                        onChange={(e) => setEditableClaim({ ...editableClaim, referralNo: e.target.value })}
+                        className="w-full border border-slate-300 rounded px-2.5 py-1.5 font-mono bg-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-semibold text-slate-700 mb-1">DurationLength (Days)</label>
+                      <input
+                        type="number"
+                        value={editableClaim.durationLength}
+                        onChange={(e) =>
+                          setEditableClaim({ ...editableClaim, durationLength: parseInt(e.target.value, 10) || 0 })
+                        }
+                        className="w-full border border-slate-300 rounded px-2.5 py-1.5 font-mono bg-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-semibold text-slate-700 mb-1">AdmissionDate</label>
+                      <input
+                        type="text"
+                        value={editableClaim.admissionDate}
+                        onChange={(e) => setEditableClaim({ ...editableClaim, admissionDate: e.target.value })}
+                        className="w-full border border-slate-300 rounded px-2.5 py-1.5 font-mono bg-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-semibold text-slate-700 mb-1">DischargeDate</label>
+                      <input
+                        type="text"
+                        value={editableClaim.dischargeDate}
+                        onChange={(e) => setEditableClaim({ ...editableClaim, dischargeDate: e.target.value })}
+                        className="w-full border border-slate-300 rounded px-2.5 py-1.5 font-mono bg-white"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Editable Treatments */}
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <label className="font-bold text-slate-800">
+                        XML &lt;Treatments&gt; ({editableClaim.treatments.length})
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setEditableClaim({
+                            ...editableClaim,
+                            treatments: [
+                              ...editableClaim.treatments,
+                              {
+                                date: editableClaim.admissionDate,
+                                type: 'Investigation',
+                                treatmentCode: 'INVE75D',
+                                icdCode: '',
+                                tariff: 0,
+                              },
+                            ],
+                          })
+                        }
+                        className="px-2.5 py-1 text-xs font-medium bg-white border border-slate-300 rounded hover:bg-slate-100"
+                      >
+                        + Add Treatment / Lab (INVE75D)
+                      </button>
+                    </div>
+                    <div className="space-y-1.5">
+                      {editableClaim.treatments.map((t, idx) => (
+                        <div key={idx} className="grid grid-cols-12 gap-2 items-center bg-white p-2 rounded border border-slate-200">
+                          <input
+                            type="text"
+                            value={t.type}
+                            onChange={(e) => {
+                              const next = [...editableClaim.treatments];
+                              next[idx] = { ...next[idx], type: e.target.value };
+                              setEditableClaim({ ...editableClaim, treatments: next });
+                            }}
+                            className="col-span-2 border border-slate-200 rounded px-2 py-1"
+                            placeholder="Type"
+                          />
+                          <input
+                            type="text"
+                            value={t.treatmentCode}
+                            onChange={(e) => {
+                              const next = [...editableClaim.treatments];
+                              next[idx] = { ...next[idx], treatmentCode: e.target.value };
+                              setEditableClaim({ ...editableClaim, treatments: next });
+                            }}
+                            className="col-span-2 border border-slate-200 rounded px-2 py-1 font-mono"
+                            placeholder="G-DRG Code"
+                          />
+                          <input
+                            type="text"
+                            value={t.icdCode}
+                            onChange={(e) => {
+                              const next = [...editableClaim.treatments];
+                              next[idx] = { ...next[idx], icdCode: e.target.value };
+                              setEditableClaim({ ...editableClaim, treatments: next });
+                            }}
+                            className="col-span-5 border border-slate-200 rounded px-2 py-1"
+                            placeholder="ICD-10 Diagnosis"
+                          />
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={t.tariff}
+                            onChange={(e) => {
+                              const next = [...editableClaim.treatments];
+                              next[idx] = { ...next[idx], tariff: parseFloat(e.target.value) || 0 };
+                              setEditableClaim({ ...editableClaim, treatments: next });
+                            }}
+                            className="col-span-2 border border-slate-200 rounded px-2 py-1 font-mono text-right"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const next = editableClaim.treatments.filter((_, i) => i !== idx);
+                              setEditableClaim({ ...editableClaim, treatments: next });
+                            }}
+                            className="col-span-1 text-red-600 hover:text-red-800 flex justify-center"
+                            title="Remove Treatment"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
                       ))}
-                    </tbody>
-                  </table>
-                )}
-              </div>
+                    </div>
+                  </div>
+
+                  {/* Editable Medicines */}
+                  <div className="space-y-2">
+                    <label className="block font-bold text-slate-800">
+                      XML &lt;Medicines&gt; ({editableClaim.medicines.length})
+                    </label>
+                    <div className="space-y-1.5">
+                      {editableClaim.medicines.map((m, idx) => (
+                        <div key={idx} className="grid grid-cols-12 gap-2 items-center bg-white p-2 rounded border border-slate-200">
+                          <input
+                            type="text"
+                            value={m.medicineCode}
+                            onChange={(e) => {
+                              const next = [...editableClaim.medicines];
+                              next[idx] = { ...next[idx], medicineCode: e.target.value };
+                              setEditableClaim({ ...editableClaim, medicines: next });
+                            }}
+                            className="col-span-2 border border-slate-200 rounded px-2 py-1 font-mono"
+                            placeholder="Code"
+                          />
+                          <input
+                            type="text"
+                            value={m.medicineDate}
+                            onChange={(e) => {
+                              const next = [...editableClaim.medicines];
+                              next[idx] = { ...next[idx], medicineDate: e.target.value };
+                              setEditableClaim({ ...editableClaim, medicines: next });
+                            }}
+                            className="col-span-2 border border-slate-200 rounded px-2 py-1 font-mono"
+                            placeholder="Date"
+                          />
+                          <input
+                            type="text"
+                            value={m.dose}
+                            onChange={(e) => {
+                              const next = [...editableClaim.medicines];
+                              next[idx] = { ...next[idx], dose: e.target.value };
+                              setEditableClaim({ ...editableClaim, medicines: next });
+                            }}
+                            className="col-span-2 border border-slate-200 rounded px-2 py-1 font-mono"
+                            placeholder="Dose"
+                          />
+                          <input
+                            type="number"
+                            value={m.frequency}
+                            onChange={(e) => {
+                              const next = [...editableClaim.medicines];
+                              next[idx] = { ...next[idx], frequency: parseFloat(e.target.value) || 1 };
+                              setEditableClaim({ ...editableClaim, medicines: next });
+                            }}
+                            className="col-span-1 border border-slate-200 rounded px-2 py-1 font-mono text-center"
+                            title="Frequency/day"
+                          />
+                          <input
+                            type="number"
+                            value={m.duration}
+                            onChange={(e) => {
+                              const next = [...editableClaim.medicines];
+                              next[idx] = { ...next[idx], duration: parseFloat(e.target.value) || 1 };
+                              setEditableClaim({ ...editableClaim, medicines: next });
+                            }}
+                            className="col-span-1 border border-slate-200 rounded px-2 py-1 font-mono text-center"
+                            title="Duration (days)"
+                          />
+                          <input
+                            type="number"
+                            value={m.quantity}
+                            onChange={(e) => {
+                              const qty = parseFloat(e.target.value) || 0;
+                              const next = [...editableClaim.medicines];
+                              next[idx] = {
+                                ...next[idx],
+                                quantity: qty,
+                                medicineTotal: Number((qty * next[idx].unitPrice).toFixed(2)),
+                              };
+                              setEditableClaim({ ...editableClaim, medicines: next });
+                            }}
+                            className="col-span-2 border border-slate-200 rounded px-2 py-1 font-mono text-right"
+                            title="Quantity Dispensed"
+                          />
+                          <span className="col-span-1 font-mono text-right text-slate-700">
+                            {(m.quantity * m.unitPrice).toFixed(2)}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const next = editableClaim.medicines.filter((_, i) => i !== idx);
+                              setEditableClaim({ ...editableClaim, medicines: next });
+                            }}
+                            className="col-span-1 text-red-600 hover:text-red-800 flex justify-center"
+                            title="Remove Medicine"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {/* Treatments & Diagnoses */}
+                  <div>
+                    <h4 className="font-bold text-slate-900 text-sm mb-2">
+                      Billed Treatments, Procedures & ICD-10 Diagnoses ({inspectedClaim.treatments.length})
+                    </h4>
+                    <table className="w-full text-left border border-slate-200 rounded-lg overflow-hidden">
+                      <thead className="bg-slate-100 border-b border-slate-200">
+                        <tr>
+                          <th className="py-2 px-3">Type</th>
+                          <th className="py-2 px-3">G-DRG Treatment Code</th>
+                          <th className="py-2 px-3">ICD-10 Code & Description</th>
+                          <th className="py-2 px-3 text-right">Tariff (GHC)</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-200 font-mono">
+                        {inspectedClaim.treatments.map((t, i) => (
+                          <tr key={i}>
+                            <td className="py-2 px-3 font-sans">{t.type}</td>
+                            <td className="py-2 px-3 font-semibold">{t.treatmentCode}</td>
+                            <td className="py-2 px-3 font-sans">{t.icdCode || '—'}</td>
+                            <td className="py-2 px-3 text-right">{t.tariff.toFixed(2)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {/* Dispensed Medicines */}
+                  <div>
+                    <h4 className="font-bold text-slate-900 text-sm mb-2">
+                      Dispensed Medicines & Prescriptions ({inspectedClaim.medicines.length})
+                    </h4>
+                    {inspectedClaim.medicines.length === 0 ? (
+                      <p className="text-slate-500">No medicines billed on this claim.</p>
+                    ) : (
+                      <table className="w-full text-left border border-slate-200 rounded-lg overflow-hidden">
+                        <thead className="bg-slate-100 border-b border-slate-200">
+                          <tr>
+                            <th className="py-2 px-3">Medicine Code</th>
+                            <th className="py-2 px-3">Date</th>
+                            <th className="py-2 px-3">Prescription Regimen</th>
+                            <th className="py-2 px-3 text-right">Dispensed Qty</th>
+                            <th className="py-2 px-3 text-right">Unit Price</th>
+                            <th className="py-2 px-3 text-right">Total (GHC)</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-200 font-mono">
+                          {inspectedClaim.medicines.map((m, i) => (
+                            <tr key={i}>
+                              <td className="py-2 px-3 font-semibold">{m.medicineCode}</td>
+                              <td className="py-2 px-3">{m.medicineDate}</td>
+                              <td className="py-2 px-3 font-sans">
+                                {m.dose} × {m.frequency}/day for {m.duration}d
+                              </td>
+                              <td className="py-2 px-3 text-right">{m.quantity}</td>
+                              <td className="py-2 px-3 text-right">{m.unitPrice.toFixed(2)}</td>
+                              <td className="py-2 px-3 text-right font-semibold">{m.medicineTotal.toFixed(2)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                </>
+              )}
             </div>
           </div>
         </div>

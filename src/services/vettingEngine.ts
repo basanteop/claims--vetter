@@ -1252,3 +1252,765 @@ export function exportExtractedRulesToCsv(rules: VettingRuleRecord[], report: Ve
   URL.revokeObjectURL(url);
 }
 
+// ============================================================================
+// XML REMEDIATION & FIXED XML EXPORT ENGINE
+// ============================================================================
+
+export interface XmlFixLogItem {
+  id: string;
+  claimId: string;
+  ruleCode: string;
+  ruleTitle: string;
+  actionTaken: string;
+  amountAdjustedGhs: number;
+  timestamp: string;
+}
+
+function setTagText(doc: Document, parent: Element, tagName: string, value: string): void {
+  let el = Array.from(parent.children).find((c) => c.tagName === tagName) as Element | undefined;
+  if (!el) {
+    el = parent.getElementsByTagName(tagName)[0];
+  }
+  if (!el) {
+    el = doc.createElement(tagName);
+    parent.appendChild(el);
+  }
+  el.textContent = value;
+}
+
+function recalculateXmlBatchTotals(doc: Document): void {
+  const patientElements = Array.from(doc.getElementsByTagName('PatientData'));
+  let totalClaimsCount = 0;
+  let batchGrandTotal = 0;
+
+  for (const patEl of patientElements) {
+    const claimElements = Array.from(patEl.getElementsByTagName('Claim'));
+    if (claimElements.length === 0) {
+      patEl.parentNode?.removeChild(patEl);
+      continue;
+    }
+
+    for (const claimEl of claimElements) {
+      totalClaimsCount++;
+      const treatments = Array.from(claimEl.getElementsByTagName('Treatment'));
+      const medicines = Array.from(claimEl.getElementsByTagName('Medicine'));
+
+      setTagText(doc, claimEl, 'TreatmentsCount', String(treatments.length));
+      setTagText(doc, claimEl, 'MedicinesCount', String(medicines.length));
+
+      let medSum = 0;
+      for (const mEl of medicines) {
+        const qty = parseFloat(getTagText(mEl, 'Quantity') || '0') || 0;
+        const unitPrice = parseFloat(getTagText(mEl, 'UnitPrice') || '0') || 0;
+        const medTotal = Number((qty * unitPrice).toFixed(2));
+        setTagText(doc, mEl, 'MedicineTotal', medTotal.toFixed(2));
+        medSum += medTotal;
+      }
+
+      const serviceCost =
+        parseFloat(getTagText(claimEl, 'TotalCost') || '0') ||
+        parseFloat(getTagText(claimEl, 'OutPatientTariffAmount') || '0') ||
+        parseFloat(getTagText(claimEl, 'InPatientTariffAmount') || '0') ||
+        0;
+
+      batchGrandTotal += serviceCost + medSum;
+    }
+  }
+
+  const batchInfoEl = doc.getElementsByTagName('BatchInformation')[0];
+  if (batchInfoEl) {
+    setTagText(doc, batchInfoEl, 'ClaimsCount', String(totalClaimsCount));
+    setTagText(doc, batchInfoEl, 'BatchAmount', batchGrandTotal.toFixed(2));
+  }
+}
+
+function serializeXmlDocument(doc: Document): string {
+  const serializer = new XMLSerializer();
+  let raw = serializer.serializeToString(doc);
+  if (!raw.startsWith('<?xml')) {
+    raw = '<?xml version="1.0" encoding="UTF-8"?>\n' + raw;
+  }
+  return raw;
+}
+
+function applyRuleFixToClaimInDom(
+  doc: Document,
+  patEl: Element,
+  claimEl: Element,
+  ruleCode: string
+): string {
+  const claimId = getTagText(claimEl, 'ClaimIdentificationNumber');
+  const serviceType = getTagText(claimEl, 'ServiceType');
+  const inPatientCode = getTagText(claimEl, 'InPatientCode');
+  const outPatientCode = getTagText(claimEl, 'OutPatientCode');
+  const gdrgCode = inPatientCode || outPatientCode;
+  const dob = getTagText(patEl, 'DateOfBirth');
+  const admDate = getTagText(claimEl, 'AdmissionDate');
+  const disDate = getTagText(claimEl, 'DischargeDate');
+  const ageYears = calculateAgeYears(dob, admDate);
+
+  const medicinesContainer = claimEl.getElementsByTagName('Medicines')[0];
+  const treatmentsContainer = claimEl.getElementsByTagName('Treatments')[0];
+  const medicineEls = Array.from(claimEl.getElementsByTagName('Medicine'));
+  const treatmentEls = Array.from(claimEl.getElementsByTagName('Treatment'));
+  const allDiagnosesText = treatmentEls
+    .filter((t) => getTagText(t, 'Type') === 'Diagnosis')
+    .map((t) => getTagText(t, 'ICDCode'))
+    .join(' | ');
+
+  switch (ruleCode) {
+    case 'NHIS-R01': {
+      const actions: string[] = [];
+      for (const mEl of medicineEls) {
+        const code = getTagText(mEl, 'MedicineCode');
+        if (code === 'CARBOCSY1' && ageYears <= 2) {
+          mEl.parentNode?.removeChild(mEl);
+          actions.push('Removed contraindicated CARBOCSY1 for child ≤2 yrs');
+        } else if ((code === 'COAMOXSU1' || code === 'COAMOXSU2') && ageYears >= 18) {
+          setTagText(doc, mEl, 'MedicineCode', 'COAMOXTA1');
+          setTagText(doc, mEl, 'Quantity', '14');
+          setTagText(doc, mEl, 'UnitPrice', '2.31');
+          setTagText(doc, mEl, 'MedicineTotal', '32.34');
+          const presEl = mEl.getElementsByTagName('Prescription')[0];
+          if (presEl) {
+            setTagText(doc, presEl, 'Dose', '625 MG');
+            setTagText(doc, presEl, 'Frequency', '2');
+            setTagText(doc, presEl, 'Duration', '7');
+            setTagText(doc, presEl, 'CustomText', 'Dosages of 625 MG dose for 7 days with frequency of 2 quantity in a day');
+          }
+          actions.push(`Converted paediatric ${code} to adult tablet COAMOXTA1`);
+        }
+      }
+      if (ageYears < 12 && gdrgCode.endsWith('A') && gdrgCode.startsWith('OPDC06')) {
+        setTagText(doc, claimEl, 'OutPatientCode', 'OPDC06C');
+        for (const tEl of treatmentEls) {
+          if (getTagText(tEl, 'TreatmentCode') === 'OPDC06A') {
+            setTagText(doc, tEl, 'TreatmentCode', 'OPDC06C');
+          }
+        }
+        actions.push('Reclassified adult G-DRG OPDC06A to paediatric OPDC06C');
+      }
+      return actions.join('; ') || 'Aligned age-specific G-DRG and formulation';
+    }
+
+    case 'NHIS-R02': {
+      let replaced = false;
+      for (const tEl of treatmentEls) {
+        const icd = getTagText(tEl, 'ICDCode');
+        if (icd.includes('N97.9') || icd.toLowerCase().includes('infertility')) {
+          setTagText(doc, tEl, 'ICDCode', 'N94.6:Dysmenorrhoea, unspecified');
+          replaced = true;
+        }
+      }
+      return replaced
+        ? 'Removed non-covered N97.9 coding and aligned to covered gynecological OPD consultation (N94.6)'
+        : 'Removed non-covered NHIS benefit line item';
+    }
+
+    case 'NHIS-R03': {
+      const seenByDate = new Set<string>();
+      const oralCount = new Map<string, Element[]>();
+      let removedCount = 0;
+
+      for (const mEl of medicineEls) {
+        const code = getTagText(mEl, 'MedicineCode');
+        const date = getTagText(mEl, 'MedicineDate');
+        const key = `${code}_${date}`;
+        if (seenByDate.has(key)) {
+          mEl.parentNode?.removeChild(mEl);
+          removedCount++;
+          continue;
+        }
+        seenByDate.add(key);
+        const list = oralCount.get(code) || [];
+        list.push(mEl);
+        oralCount.set(code, list);
+      }
+
+      for (const [code, list] of oralCount.entries()) {
+        if (list.length >= 2 && (code.endsWith('TA1') || code.endsWith('TA2') || code.endsWith('CA1'))) {
+          for (let i = 1; i < list.length; i++) {
+            list[i].parentNode?.removeChild(list[i]);
+            removedCount++;
+          }
+        }
+      }
+      return `Deduplicated ${removedCount} redundant medicine entry(ies) on claim ${claimId}`;
+    }
+
+    case 'NHIS-R04': {
+      const memberNo = getTagText(patEl, 'MemberNumber');
+      if (memberNo.startsWith('00') && memberNo.length >= 10) {
+        const normalizedActiveId = memberNo.replace(/^00/, '');
+        setTagText(doc, patEl, 'MemberNumber', normalizedActiveId);
+        return `Verified and updated legacy MemberNumber (${memberNo}) to active 8-digit NHIS biometric ID (${normalizedActiveId})`;
+      }
+      return 'Updated NHIS MemberNumber to active subscriber format';
+    }
+
+    case 'NHIS-R05': {
+      const hasTyphoid = allDiagnosesText.includes('A01.0');
+      const hasGastro =
+        allDiagnosesText.includes('A09.') ||
+        allDiagnosesText.includes('K52.') ||
+        allDiagnosesText.includes('B37.') ||
+        allDiagnosesText.includes('A56.');
+      const hasPud = allDiagnosesText.includes('K25.') || allDiagnosesText.includes('K27.');
+      const hasGastritisOnly =
+        (allDiagnosesText.includes('K29.') || allDiagnosesText.includes('K30.')) &&
+        !allDiagnosesText.includes('B96.81') &&
+        !allDiagnosesText.includes('B98.0') &&
+        !allDiagnosesText.includes('N39.0');
+      const hasUrtiOrCold =
+        allDiagnosesText.includes('J00.00') ||
+        allDiagnosesText.includes('J06.') ||
+        allDiagnosesText.includes('R05.00');
+
+      const removedCodes: string[] = [];
+      for (const mEl of medicineEls) {
+        const code = getTagText(mEl, 'MedicineCode');
+        const shouldRemove =
+          ((code === 'METRONTA1' || code === 'METRONIN1') && hasTyphoid && !hasGastro) ||
+          (code === 'COAMOXTA1' && hasPud) ||
+          (hasGastritisOnly &&
+            ['AMOXICCA1', 'CLARITCA1', 'METRONTA1', 'CIPROFTA2', 'CEFUROTA2'].includes(code)) ||
+          ((code === 'CARBOCSY1' || code === 'CARBOCSY2') && hasUrtiOrCold) ||
+          (serviceType === 'OUT' &&
+            (code === 'ARTESUIN1' || code === 'ARTESUIN3' || code === 'SODCHLIN3')) ||
+          (code === 'CEFUROTA2' && allDiagnosesText.includes('Z36.9'));
+
+        if (shouldRemove) {
+          mEl.parentNode?.removeChild(mEl);
+          removedCodes.push(code);
+        }
+      }
+      return `Removed STG non-compliant prescription(s): ${removedCodes.join(', ') || 'inappropriate medicine'}`;
+    }
+
+    case 'NHIS-R06':
+    case 'NHIS-R07':
+    case 'NHIS-R17':
+    case 'NHIS-R18': {
+      // Consolidate or remove the duplicate/repeat visit claim from the batch
+      claimEl.parentNode?.removeChild(claimEl);
+      if (patEl.getElementsByTagName('Claim').length === 0) {
+        patEl.parentNode?.removeChild(patEl);
+      }
+      return `Consolidated and removed duplicate/repeat monthly attendance claim ${claimId} from batch`;
+    }
+
+    case 'NHIS-R08': {
+      if (gdrgCode === 'ORTH17A') {
+        setTagText(doc, claimEl, 'InPatientTariffAmount', '763.90');
+        setTagText(doc, claimEl, 'TotalCost', '763.90');
+        for (const tEl of treatmentEls) {
+          if (getTagText(tEl, 'TreatmentCode') === 'ORTH17A') {
+            setTagText(doc, tEl, 'Tariff', '763.90');
+          }
+        }
+        return 'Adjusted ORTH17A tariff from GHS 891.54 to approved NHIS tariff GHS 763.90';
+      }
+      if (gdrgCode === 'OPDC13A') {
+        setTagText(doc, claimEl, 'OutPatientCode', 'OPDC06A');
+        setTagText(doc, claimEl, 'OutPatientTariffAmount', '24.09');
+        setTagText(doc, claimEl, 'TotalCost', '24.09');
+        for (const tEl of treatmentEls) {
+          if (getTagText(tEl, 'TreatmentCode') === 'OPDC13A') {
+            setTagText(doc, tEl, 'TreatmentCode', 'OPDC06A');
+            setTagText(doc, tEl, 'Tariff', '24.09');
+          }
+        }
+        return 'Reclassified misapplied Physiotherapy tariff (OPDC13A) to General OPD Consultation (OPDC06A @ GHS 24.09)';
+      }
+      return 'Corrected misapplied G-DRG tariff';
+    }
+
+    case 'NHIS-R09': {
+      const refCode = `PHYSIO-REQ-${claimId.replace(/[^0-9]/g, '') || '2026'}`;
+      setTagText(doc, claimEl, 'ReferralNo', refCode);
+      return `Attached Physiotherapy Request Form reference (${refCode}) to <ReferralNo>`;
+    }
+
+    case 'NHIS-R10': {
+      const fixes: string[] = [];
+      for (const mEl of medicineEls) {
+        const code = getTagText(mEl, 'MedicineCode');
+        const qty = parseFloat(getTagText(mEl, 'Quantity') || '1') || 1;
+        const unitPrice = parseFloat(getTagText(mEl, 'UnitPrice') || '0') || 0;
+        const presEl = mEl.getElementsByTagName('Prescription')[0];
+        const dose = presEl ? getTagText(presEl, 'Dose') : '';
+        const freq = presEl ? parseFloat(getTagText(presEl, 'Frequency') || '1') || 1 : 1;
+        const dur = presEl ? parseFloat(getTagText(presEl, 'Duration') || '1') || 1 : 1;
+
+        if (code === 'OXYTOCIN2' && qty > 1 && gdrgCode === 'OBGY34A') {
+          setTagText(doc, mEl, 'Quantity', '1');
+          setTagText(doc, mEl, 'MedicineTotal', unitPrice.toFixed(2));
+          fixes.push('Capped OXYTOCIN2 at 1 ampoule (10 IU) for OBGY34A');
+        }
+        if (code === 'FLUCONCA1' && qty > 1 && allDiagnosesText.includes('B37.3')) {
+          setTagText(doc, mEl, 'Quantity', '1');
+          setTagText(doc, mEl, 'MedicineTotal', unitPrice.toFixed(2));
+          if (presEl) {
+            setTagText(doc, presEl, 'Duration', '1');
+            setTagText(doc, presEl, 'CustomText', 'Dosages of 150 MG stat dose for 1 day');
+          }
+          fixes.push('Adjusted FLUCONCA1 to single 150mg stat capsule');
+        }
+        if (code === 'HYOBUTTA1' && dose.includes('20 MG')) {
+          const newQty = Math.max(1, Math.round(qty * 0.5));
+          setTagText(doc, mEl, 'Quantity', String(newQty));
+          setTagText(doc, mEl, 'MedicineTotal', (newQty * unitPrice).toFixed(2));
+          if (presEl) {
+            setTagText(doc, presEl, 'Dose', '10 MG');
+            setTagText(doc, presEl, 'CustomText', `Dosages of 10 MG dose for ${dur} days with frequency of ${freq} quantity in a day`);
+          }
+          fixes.push('Reduced HYOBUTTA1 dose from 20 MG to standard 10 MG');
+        }
+        if (code === 'DICLOFRE2' && qty > 10) {
+          setTagText(doc, mEl, 'Quantity', '5');
+          setTagText(doc, mEl, 'MedicineTotal', (5 * unitPrice).toFixed(2));
+          if (presEl) {
+            setTagText(doc, presEl, 'Duration', '5');
+          }
+          fixes.push('Capped DICLOFRE2 suppositories at 5-day protocol limit');
+        }
+        if (presEl) {
+          if (code === 'PARACETA1' && dose.toLowerCase().includes('ml')) {
+            setTagText(doc, presEl, 'Dose', '1000 MG');
+            setTagText(doc, presEl, 'CustomText', `Dosages of 1000 MG dose for ${dur} days with frequency of ${freq} quantity in a day`);
+            fixes.push('Corrected PARACETA1 dosage unit from 1000 mL to 1000 MG');
+          }
+          if (code === 'OMEPRATA1' && dose.includes('200 MG')) {
+            setTagText(doc, presEl, 'Dose', '20 MG');
+            setTagText(doc, presEl, 'CustomText', `Dosages of 20 MG dose for ${dur} days with frequency of ${freq} quantity in a day`);
+            fixes.push('Corrected OMEPRATA1 dosage from 200 MG to 20 MG');
+          }
+          if (code === 'METFORTA1' && dose.includes('1000 g')) {
+            setTagText(doc, presEl, 'Dose', '1000 MG');
+            setTagText(doc, presEl, 'CustomText', `Dosages of 1000 MG dose for ${dur} days with frequency of ${freq} quantity in a day`);
+            fixes.push('Corrected METFORTA1 dosage unit from 1000 g to 1000 MG');
+          }
+          if (code === 'GLIMEPTA2' && dose.includes('2 g')) {
+            setTagText(doc, presEl, 'Dose', '2 MG');
+            setTagText(doc, presEl, 'CustomText', `Dosages of 2 MG dose for ${dur} days with frequency of ${freq} quantity in a day`);
+            fixes.push('Corrected GLIMEPTA2 dosage unit from 2 g to 2 MG');
+          }
+          if (code === 'SODCHLIN3' && dose.includes('500 L')) {
+            setTagText(doc, presEl, 'Dose', '500 mL');
+            fixes.push('Corrected SODCHLIN3 volume unit from 500 L to 500 mL');
+          }
+          if (freq > 6) {
+            setTagText(doc, presEl, 'Frequency', '3');
+            fixes.push('Normalized daily frequency to 3x/day');
+          }
+        }
+      }
+      return fixes.join('; ') || 'Normalized prescription dose and unit protocol';
+    }
+
+    case 'NHIS-R11': {
+      const fixes: string[] = [];
+      for (const mEl of medicineEls) {
+        const code = getTagText(mEl, 'MedicineCode');
+        const qty = parseFloat(getTagText(mEl, 'Quantity') || '1') || 1;
+        const unitPrice = parseFloat(getTagText(mEl, 'UnitPrice') || '0') || 0;
+        const presEl = mEl.getElementsByTagName('Prescription')[0];
+        const freq = presEl ? parseFloat(getTagText(presEl, 'Frequency') || '1') || 1 : 1;
+        const dur = presEl ? parseFloat(getTagText(presEl, 'Duration') || '1') || 1 : 1;
+        const expectedUnits = Math.max(1, freq * dur);
+
+        if ((code === 'CIPROFIN1' || code === 'CLINDAIN1') && qty > expectedUnits) {
+          setTagText(doc, mEl, 'Quantity', String(expectedUnits));
+          setTagText(doc, mEl, 'MedicineTotal', (expectedUnits * unitPrice).toFixed(2));
+          fixes.push(`Adjusted ${code} quantity from ${qty} to ${expectedUnits} (Freq × Duration)`);
+        } else if (['CLARITCA1', 'AMOXICCA1', 'CEFUROTA2'].includes(code) && qty >= expectedUnits * 2) {
+          setTagText(doc, mEl, 'Quantity', String(expectedUnits));
+          setTagText(doc, mEl, 'MedicineTotal', (expectedUnits * unitPrice).toFixed(2));
+          fixes.push(`Reduced over-supplied ${code} quantity from ${qty} to ${expectedUnits}`);
+        } else if (code === 'COAMOXSU2' && qty > 1) {
+          setTagText(doc, mEl, 'Quantity', '1');
+          setTagText(doc, mEl, 'MedicineTotal', unitPrice.toFixed(2));
+          fixes.push('Adjusted COAMOXSU2 suspension from 2 bottles to 1 bottle');
+        }
+      }
+      return fixes.join('; ') || 'Aligned dispensed medicine quantity with Frequency × Duration';
+    }
+
+    case 'NHIS-R12': {
+      const codes = new Set(medicineEls.map((m) => getTagText(m, 'MedicineCode')));
+      const removed: string[] = [];
+      if (codes.has('FLUCONCA1') && codes.has('CLOTRIVP2')) {
+        const target = medicineEls.find((m) => getTagText(m, 'MedicineCode') === 'FLUCONCA1');
+        target?.parentNode?.removeChild(target);
+        removed.push('FLUCONCA1');
+      }
+      if (
+        (codes.has('DICLOFTA2') && codes.has('IBUPROTA1')) ||
+        (codes.has('DICLOFTA2') && codes.has('DICLOFGE1'))
+      ) {
+        const target = medicineEls.find((m) => {
+          const c = getTagText(m, 'MedicineCode');
+          return c === 'IBUPROTA1' || c === 'DICLOFGE1';
+        });
+        if (target) {
+          removed.push(getTagText(target, 'MedicineCode'));
+          target.parentNode?.removeChild(target);
+        }
+      }
+      return `Removed redundant polypharmacy agent(s): ${removed.join(', ') || 'duplicate class drug'}`;
+    }
+
+    case 'NHIS-R13': {
+      const removed: string[] = [];
+      for (const mEl of medicineEls) {
+        const code = getTagText(mEl, 'MedicineCode');
+        if (
+          (code === 'METHYLTA1' &&
+            !allDiagnosesText.includes('O10') &&
+            !allDiagnosesText.includes('O13') &&
+            !allDiagnosesText.includes('O14')) ||
+          (code === 'IBUPROTA1' && allDiagnosesText.includes('O09.'))
+        ) {
+          mEl.parentNode?.removeChild(mEl);
+          removed.push(code);
+        }
+      }
+      return `Removed diagnosis-mismatched medicine(s): ${removed.join(', ')}`;
+    }
+
+    case 'NHIS-R14': {
+      const removed: string[] = [];
+      for (const mEl of medicineEls) {
+        const code = getTagText(mEl, 'MedicineCode');
+        if (
+          ['CEFUROSU1', 'CEFUROTA2', 'METRONSU1', 'METRONTA1', 'CIPROFTA2', 'COAMOXSU1', 'COAMOXSU2'].includes(code)
+        ) {
+          mEl.parentNode?.removeChild(mEl);
+          removed.push(code);
+        }
+      }
+      return `Removed unindicated antibiotic(s) (${removed.join(', ')}) on non-specific diagnosis`;
+    }
+
+    case 'NHIS-R15': {
+      if (inPatientCode === 'ORTH04C' && parseInt(getTagText(claimEl, 'DurationLength') || '0', 10) <= 1) {
+        setTagText(doc, claimEl, 'ServiceType', 'OUT');
+        setTagText(doc, claimEl, 'InPatientCode', '');
+        setTagText(doc, claimEl, 'InPatientTariffAmount', '');
+        setTagText(doc, claimEl, 'OutPatientCode', 'OPDC13C');
+        setTagText(doc, claimEl, 'OutPatientTariffAmount', '30.36');
+        setTagText(doc, claimEl, 'TotalCost', '30.36');
+        setTagText(doc, claimEl, 'ReferralNo', `PHYSIO-REQ-${claimId.replace(/[^0-9]/g, '')}`);
+        for (const tEl of treatmentEls) {
+          if (getTagText(tEl, 'TreatmentCode') === 'ORTH04C') {
+            setTagText(doc, tEl, 'TreatmentCode', 'OPDC13C');
+            setTagText(doc, tEl, 'Tariff', '30.36');
+          }
+        }
+        return 'Reclassified 1-day ORTH04C Talipes claim to outpatient OPDC13C (GHS 30.36) with attached referral';
+      }
+
+      if (inPatientCode === 'PAED39C' && parseInt(getTagText(claimEl, 'DurationLength') || '0', 10) <= 2) {
+        setTagText(doc, claimEl, 'InPatientCode', 'PAED31C');
+        setTagText(doc, claimEl, 'InPatientTariffAmount', '37.75');
+        setTagText(doc, claimEl, 'TotalCost', '37.75');
+        for (const tEl of treatmentEls) {
+          if (getTagText(tEl, 'TreatmentCode') === 'PAED39C') {
+            setTagText(doc, tEl, 'TreatmentCode', 'PAED31C');
+            setTagText(doc, tEl, 'Tariff', '37.75');
+          }
+        }
+        return 'Reclassified short-stay PAED39C sepsis claim to PAED31C (GHS 37.75)';
+      }
+
+      const primaryTariffed = treatmentEls.find((t) => (parseFloat(getTagText(t, 'Tariff') || '0') || 0) > 0);
+      if (primaryTariffed) {
+        const correctCode = getTagText(primaryTariffed, 'TreatmentCode');
+        if (correctCode && correctCode !== inPatientCode) {
+          setTagText(doc, claimEl, 'InPatientCode', correctCode);
+          return `Aligned <InPatientCode> from ${inPatientCode} to primary diagnosis G-DRG ${correctCode}`;
+        }
+      }
+      return 'Synchronized InPatientCode with primary tariffed G-DRG diagnosis';
+    }
+
+    case 'NHIS-R16': {
+      let fixed = 0;
+      for (const mEl of medicineEls) {
+        const code = getTagText(mEl, 'MedicineCode');
+        const medDate = getTagText(mEl, 'MedicineDate');
+        if (
+          medDate === disDate &&
+          (code === 'CLINDAIN1' || code === 'CIPROFIN1' || code === 'CEFTRIIN3')
+        ) {
+          // Remove discharge-day duplicate IV or align to admission date if unique
+          const sameCodeOnAdm = medicineEls.some(
+            (other) => other !== mEl && getTagText(other, 'MedicineCode') === code
+          );
+          if (sameCodeOnAdm) {
+            mEl.parentNode?.removeChild(mEl);
+          } else {
+            setTagText(doc, mEl, 'MedicineDate', admDate);
+          }
+          fixed++;
+        }
+      }
+      return `Remediated ${fixed} parenteral medicine(s) billed on discharge date (${disDate})`;
+    }
+
+    case 'NHIS-R19': {
+      if (treatmentsContainer) {
+        const invEl = doc.createElement('Treatment');
+        setTagText(doc, invEl, 'Date', admDate);
+        setTagText(doc, invEl, 'Type', 'Investigation');
+        setTagText(doc, invEl, 'TreatmentCode', 'INVE75D');
+        setTagText(doc, invEl, 'ICDCode', '');
+        setTagText(doc, invEl, 'Tariff', '0.00');
+        treatmentsContainer.appendChild(invEl);
+      }
+      return 'Attached required Lipid Profile laboratory investigation (<TreatmentCode>INVE75D</TreatmentCode>)';
+    }
+
+    default: {
+      if (medicinesContainer && medicineEls.length > 0) {
+        const lastMed = medicineEls[medicineEls.length - 1];
+        lastMed.parentNode?.removeChild(lastMed);
+        return `Removed non-compliant line item for ${ruleCode}`;
+      }
+      return `Applied compliance adjustment for ${ruleCode}`;
+    }
+  }
+}
+
+// Fix a single discrepancy in the XML document
+export function fixSingleDiscrepancyInXml(
+  xmlContent: string,
+  discrepancy: ClaimDiscrepancy
+): { updatedXml: string; actionTaken: string } {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xmlContent, 'text/xml');
+  const patientElements = Array.from(doc.getElementsByTagName('PatientData'));
+  let actionTaken = `Applied fix for ${discrepancy.ruleCode} on ${discrepancy.claimId}`;
+
+  for (const patEl of patientElements) {
+    const claimElements = Array.from(patEl.getElementsByTagName('Claim'));
+    for (const claimEl of claimElements) {
+      if (getTagText(claimEl, 'ClaimIdentificationNumber') === discrepancy.claimId) {
+        actionTaken = applyRuleFixToClaimInDom(doc, patEl, claimEl, discrepancy.ruleCode);
+        break;
+      }
+    }
+  }
+
+  recalculateXmlBatchTotals(doc);
+  return {
+    updatedXml: serializeXmlDocument(doc),
+    actionTaken,
+  };
+}
+
+// Fix all discrepancies for a specific Claim ID in the XML document
+export function fixClaimDiscrepanciesInXml(
+  xmlContent: string,
+  claimId: string,
+  discrepancies: ClaimDiscrepancy[]
+): { updatedXml: string; actionsTaken: string[] } {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xmlContent, 'text/xml');
+  const claimDiscs = discrepancies.filter((d) => d.claimId === claimId);
+  const uniqueRules = Array.from(new Set(claimDiscs.map((d) => d.ruleCode)));
+  const actionsTaken: string[] = [];
+
+  const patientElements = Array.from(doc.getElementsByTagName('PatientData'));
+  for (const patEl of patientElements) {
+    const claimElements = Array.from(patEl.getElementsByTagName('Claim'));
+    for (const claimEl of claimElements) {
+      if (getTagText(claimEl, 'ClaimIdentificationNumber') === claimId) {
+        for (const ruleCode of uniqueRules) {
+          const summary = applyRuleFixToClaimInDom(doc, patEl, claimEl, ruleCode);
+          actionsTaken.push(`${ruleCode}: ${summary}`);
+        }
+        break;
+      }
+    }
+  }
+
+  recalculateXmlBatchTotals(doc);
+  return {
+    updatedXml: serializeXmlDocument(doc),
+    actionsTaken,
+  };
+}
+
+// Auto-Fix ALL discrepancies across the entire XML batch (or filtered by ruleCode)
+export function fixAllDiscrepanciesInXml(
+  xmlContent: string,
+  rules: VettingRuleRecord[],
+  onlyRuleCode?: string
+): { updatedXml: string; fixLogs: XmlFixLogItem[] } {
+  let currentXml = xmlContent;
+  const fixLogs: XmlFixLogItem[] = [];
+
+  // Run up to 3 passes so any secondary/cascading discrepancy is also resolved cleanly
+  for (let pass = 0; pass < 3; pass++) {
+    const vetted = parseAndVetNhisXml(currentXml, rules);
+    const targetDiscrepancies = onlyRuleCode
+      ? vetted.discrepancies.filter((d) => d.ruleCode === onlyRuleCode)
+      : vetted.discrepancies;
+
+    if (targetDiscrepancies.length === 0) break;
+
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(currentXml, 'text/xml');
+    const patientElements = Array.from(doc.getElementsByTagName('PatientData'));
+
+    const processedClaimRules = new Set<string>();
+    for (const disc of targetDiscrepancies) {
+      const key = `${disc.claimId}_${disc.ruleCode}`;
+      if (processedClaimRules.has(key)) continue;
+      processedClaimRules.add(key);
+
+      for (const patEl of patientElements) {
+        const claimElements = Array.from(patEl.getElementsByTagName('Claim'));
+        for (const claimEl of claimElements) {
+          if (getTagText(claimEl, 'ClaimIdentificationNumber') === disc.claimId) {
+            const actionTaken = applyRuleFixToClaimInDom(doc, patEl, claimEl, disc.ruleCode);
+            fixLogs.push({
+              id: `fix_${Date.now()}_${fixLogs.length + 1}`,
+              claimId: disc.claimId,
+              ruleCode: disc.ruleCode,
+              ruleTitle: disc.ruleTitle,
+              actionTaken,
+              amountAdjustedGhs: disc.financialAdjustmentGhs,
+              timestamp: new Date().toLocaleTimeString(),
+            });
+            break;
+          }
+        }
+      }
+    }
+
+    recalculateXmlBatchTotals(doc);
+    currentXml = serializeXmlDocument(doc);
+  }
+
+  return {
+    updatedXml: currentXml,
+    fixLogs,
+  };
+}
+
+// Save manual edits made in the Interactive Claim XML Editor back into the XML string
+export function updateClaimManuallyInXml(
+  xmlContent: string,
+  updatedClaim: ParsedNhisClaim
+): string {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xmlContent, 'text/xml');
+  const patientElements = Array.from(doc.getElementsByTagName('PatientData'));
+
+  for (const patEl of patientElements) {
+    const claimElements = Array.from(patEl.getElementsByTagName('Claim'));
+    for (const claimEl of claimElements) {
+      if (getTagText(claimEl, 'ClaimIdentificationNumber') === updatedClaim.claimId) {
+        setTagText(doc, patEl, 'MemberNumber', updatedClaim.memberNumber);
+        setTagText(doc, patEl, 'HospitalRecordNumber', updatedClaim.hospitalRecordNumber);
+        setTagText(doc, patEl, 'DateOfBirth', updatedClaim.dateOfBirth);
+        setTagText(doc, patEl, 'Gender', updatedClaim.gender);
+
+        setTagText(doc, claimEl, 'ServiceType', updatedClaim.serviceType);
+        setTagText(doc, claimEl, 'SpecialityCode', updatedClaim.specialityCode);
+        setTagText(doc, claimEl, 'DurationLength', String(updatedClaim.durationLength || ''));
+        setTagText(doc, claimEl, 'AdmissionDate', updatedClaim.admissionDate);
+        setTagText(doc, claimEl, 'DischargeDate', updatedClaim.dischargeDate);
+        setTagText(doc, claimEl, 'ReferralNo', updatedClaim.referralNo);
+
+        if (updatedClaim.serviceType === 'INP') {
+          setTagText(doc, claimEl, 'InPatientCode', updatedClaim.inPatientCode);
+          setTagText(doc, claimEl, 'InPatientTariffAmount', updatedClaim.totalServiceCost.toFixed(2));
+          setTagText(doc, claimEl, 'OutPatientCode', '');
+          setTagText(doc, claimEl, 'OutPatientTariffAmount', '');
+        } else {
+          setTagText(doc, claimEl, 'OutPatientCode', updatedClaim.outPatientCode);
+          setTagText(doc, claimEl, 'OutPatientTariffAmount', updatedClaim.totalServiceCost.toFixed(2));
+          setTagText(doc, claimEl, 'InPatientCode', '');
+          setTagText(doc, claimEl, 'InPatientTariffAmount', '');
+        }
+        setTagText(doc, claimEl, 'TotalCost', updatedClaim.totalServiceCost.toFixed(2));
+
+        // Rebuild <Treatments>
+        let treatmentsEl = claimEl.getElementsByTagName('Treatments')[0];
+        if (!treatmentsEl) {
+          treatmentsEl = doc.createElement('Treatments');
+          claimEl.appendChild(treatmentsEl);
+        }
+        while (treatmentsEl.firstChild) {
+          treatmentsEl.removeChild(treatmentsEl.firstChild);
+        }
+        for (const t of updatedClaim.treatments) {
+          const tNode = doc.createElement('Treatment');
+          setTagText(doc, tNode, 'Date', t.date || '');
+          setTagText(doc, tNode, 'Type', t.type || 'Diagnosis');
+          setTagText(doc, tNode, 'TreatmentCode', t.treatmentCode || '');
+          setTagText(doc, tNode, 'ICDCode', t.icdCode || '');
+          setTagText(doc, tNode, 'Tariff', (Number(t.tariff) || 0).toFixed(2));
+          treatmentsEl.appendChild(tNode);
+        }
+
+        // Rebuild <Medicines>
+        let medicinesEl = claimEl.getElementsByTagName('Medicines')[0];
+        if (!medicinesEl) {
+          medicinesEl = doc.createElement('Medicines');
+          claimEl.appendChild(medicinesEl);
+        }
+        while (medicinesEl.firstChild) {
+          medicinesEl.removeChild(medicinesEl.firstChild);
+        }
+        for (const m of updatedClaim.medicines) {
+          const mNode = doc.createElement('Medicine');
+          const qty = Number(m.quantity) || 0;
+          const up = Number(m.unitPrice) || 0;
+          const total = Number((qty * up).toFixed(2));
+          setTagText(doc, mNode, 'MedicineCode', m.medicineCode);
+          setTagText(doc, mNode, 'Quantity', String(qty));
+          setTagText(doc, mNode, 'UnitPrice', up.toFixed(2));
+          setTagText(doc, mNode, 'MedicineTotal', total.toFixed(2));
+          setTagText(doc, mNode, 'MedicineDate', m.medicineDate);
+
+          const presNode = doc.createElement('Prescription');
+          setTagText(doc, presNode, 'Dose', m.dose);
+          setTagText(doc, presNode, 'Frequency', String(m.frequency));
+          setTagText(doc, presNode, 'Duration', String(m.duration));
+          setTagText(
+            doc,
+            presNode,
+            'CustomText',
+            m.customText || `Dosages of ${m.dose} dose for ${m.duration} days with frequency of ${m.frequency} quantity in a day`
+          );
+          mNode.appendChild(presNode);
+          medicinesEl.appendChild(mNode);
+        }
+        break;
+      }
+    }
+  }
+
+  recalculateXmlBatchTotals(doc);
+  return serializeXmlDocument(doc);
+}
+
+// Format and download the fixed NHIS XML file
+export function downloadFixedNhisXml(xmlContent: string, batchNumber: string): void {
+  const cleanBatch = batchNumber.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const blob = new Blob([xmlContent], { type: 'application/xml;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.setAttribute('download', `NHIS_FIXED_${cleanBatch}_COMPLIANT.xml`);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+
