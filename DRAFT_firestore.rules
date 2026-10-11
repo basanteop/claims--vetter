@@ -1,0 +1,274 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1 & Phase 4.1: Global Safety Net (Default-Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Phase 3: Reusable Hardened Global Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isBootstrappedAdmin() {
+      return isEmailVerified() && request.auth.token.email == 'basanteopoku@gmail.com';
+    }
+
+    function isAdmin() {
+      return isEmailVerified() && (
+        request.auth.token.email == 'basanteopoku@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    // Validation Blueprints (Pillar 2: Anti-Update-Gap)
+    function isValidAdminMarker(data) {
+      return data.keys().hasAll(['uid', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'createdAt']) &&
+        isValidId(data.uid) &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'displayName', 'role', 'department', 'hipaaCertified', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'displayName', 'role', 'department', 'hipaaCertified', 'createdAt', 'updatedAt']) &&
+        isValidId(data.uid) &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100 &&
+        data.role is string && data.role in ['admin', 'senior_auditor', 'claims_officer', 'viewer'] &&
+        data.department is string && data.department.size() >= 1 && data.department.size() <= 80 &&
+        data.hipaaCertified is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidUserPrivateInfo(data) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'createdAt']) &&
+        isValidId(data.uid) &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidVettingRule(data) {
+      return data.keys().hasAll(['ruleId', 'code', 'title', 'category', 'severity', 'description', 'criteriaSummary', 'sourceDocument', 'isActive', 'authorId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ruleId', 'code', 'title', 'category', 'severity', 'description', 'criteriaSummary', 'sourceDocument', 'isActive', 'authorId', 'createdAt', 'updatedAt']) &&
+        isValidId(data.ruleId) &&
+        data.code is string && data.code.size() >= 2 && data.code.size() <= 40 &&
+        data.title is string && data.title.size() >= 2 && data.title.size() <= 160 &&
+        data.category is string && data.category in ['Clinical', 'Tariff', 'Membership', 'Pharmacy', 'Documentation'] &&
+        data.severity is string && data.severity in ['critical', 'high', 'medium', 'low'] &&
+        data.description is string && data.description.size() >= 2 && data.description.size() <= 1000 &&
+        data.criteriaSummary is string && data.criteriaSummary.size() >= 2 && data.criteriaSummary.size() <= 1000 &&
+        data.sourceDocument is string && data.sourceDocument.size() >= 1 && data.sourceDocument.size() <= 200 &&
+        data.isActive is bool &&
+        isValidId(data.authorId) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAuditReport(data) {
+      return data.keys().hasAll(['reportId', 'batchNumber', 'facilityName', 'serviceMonth', 'serviceYear', 'totalClaims', 'totalBatchAmount', 'flaggedClaimsCount', 'estimatedAdjustmentAmount', 'criticalAlertsCount', 'status', 'hipaaEncryptionHash', 'authorId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['reportId', 'batchNumber', 'facilityName', 'serviceMonth', 'serviceYear', 'totalClaims', 'totalBatchAmount', 'flaggedClaimsCount', 'estimatedAdjustmentAmount', 'criticalAlertsCount', 'status', 'hipaaEncryptionHash', 'authorId', 'createdAt', 'updatedAt']) &&
+        isValidId(data.reportId) &&
+        data.batchNumber is string && data.batchNumber.size() >= 1 && data.batchNumber.size() <= 120 &&
+        data.facilityName is string && data.facilityName.size() >= 1 && data.facilityName.size() <= 200 &&
+        data.serviceMonth is string && data.serviceMonth.size() >= 1 && data.serviceMonth.size() <= 20 &&
+        data.serviceYear is string && data.serviceYear.size() >= 4 && data.serviceYear.size() <= 10 &&
+        data.totalClaims is int && data.totalClaims >= 0 &&
+        data.totalBatchAmount is number && data.totalBatchAmount >= 0 &&
+        data.flaggedClaimsCount is int && data.flaggedClaimsCount >= 0 &&
+        data.estimatedAdjustmentAmount is number && data.estimatedAdjustmentAmount >= 0 &&
+        data.criticalAlertsCount is int && data.criticalAlertsCount >= 0 &&
+        data.status is string && data.status in ['in_review', 'approved', 'escalated', 'locked'] &&
+        data.hipaaEncryptionHash is string && data.hipaaEncryptionHash.size() >= 8 && data.hipaaEncryptionHash.size() <= 128 &&
+        isValidId(data.authorId) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidComplianceAlert(data) {
+      return data.keys().hasAll(['alertId', 'reportId', 'batchNumber', 'claimId', 'ruleCode', 'severity', 'title', 'message', 'financialImpact', 'status', 'authorId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['alertId', 'reportId', 'batchNumber', 'claimId', 'ruleCode', 'severity', 'title', 'message', 'financialImpact', 'status', 'authorId', 'createdAt', 'updatedAt']) &&
+        isValidId(data.alertId) &&
+        isValidId(data.reportId) &&
+        data.batchNumber is string && data.batchNumber.size() >= 1 && data.batchNumber.size() <= 120 &&
+        data.claimId is string && data.claimId.size() >= 1 && data.claimId.size() <= 80 &&
+        data.ruleCode is string && data.ruleCode.size() >= 1 && data.ruleCode.size() <= 40 &&
+        data.severity is string && data.severity in ['critical', 'high', 'medium'] &&
+        data.title is string && data.title.size() >= 2 && data.title.size() <= 200 &&
+        data.message is string && data.message.size() >= 2 && data.message.size() <= 1000 &&
+        data.financialImpact is number && data.financialImpact >= 0 &&
+        data.status is string && data.status in ['open', 'acknowledged', 'resolved'] &&
+        isValidId(data.authorId) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidHipaaAuditLog(data) {
+      return data.keys().hasAll(['logId', 'actorUid', 'actorRole', 'action', 'resourceType', 'resourceId', 'details', 'createdAt']) &&
+        data.keys().hasOnly(['logId', 'actorUid', 'actorRole', 'action', 'resourceType', 'resourceId', 'details', 'createdAt']) &&
+        isValidId(data.logId) &&
+        isValidId(data.actorUid) &&
+        data.actorRole is string && data.actorRole in ['admin', 'senior_auditor', 'claims_officer', 'viewer'] &&
+        data.action is string && data.action.size() >= 2 && data.action.size() <= 120 &&
+        data.resourceType is string && data.resourceType.size() >= 2 && data.resourceType.size() <= 80 &&
+        data.resourceId is string && data.resourceId.size() >= 1 && data.resourceId.size() <= 128 &&
+        data.details is string && data.details.size() >= 2 && data.details.size() <= 500 &&
+        data.createdAt is timestamp;
+    }
+
+    // Collection 1: /admins/{userId}
+    match /admins/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isSignedIn() && (resource.data.uid == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isEmailVerified() && isValidId(userId) && isValidAdminMarker(incoming()) && incoming().uid == userId && incoming().createdAt == request.time && isAdmin();
+      allow update: if false;
+      allow delete: if isEmailVerified() && isValidId(userId) && isAdmin();
+    }
+
+    // Collection 2: /users/{userId} (Operational RBAC profile without PII)
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isSignedIn() && (resource.data.uid == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isEmailVerified() && isValidId(userId) && isValidUserProfile(incoming()) &&
+        incoming().uid == userId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (
+          (isOwner(userId) && incoming().role in ['claims_officer', 'viewer']) ||
+          isAdmin()
+        );
+      allow update: if isEmailVerified() && isValidId(userId) && isValidUserProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          // Action 1: Owner updates displayName, department, hipaaCertified (cannot escalate role)
+          (isOwner(userId) && incoming().role == existing().role && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'department', 'hipaaCertified', 'updatedAt'])) ||
+          // Action 2: Admin updates user role or profile
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'role', 'department', 'hipaaCertified', 'updatedAt']))
+        );
+      allow delete: if isEmailVerified() && isValidId(userId) && isAdmin();
+
+      // Subcollection 2a: /users/{userId}/private/{docId} (Pillar 6: PII Isolation & Pillar 1: Master Gate)
+      match /private/{docId} {
+        allow get: if isSignedIn() && isValidId(userId) && isValidId(docId) &&
+          exists(/databases/$(database)/documents/users/$(userId)) &&
+          (isOwner(userId) || isAdmin());
+        allow list: if isSignedIn() && (resource.data.uid == request.auth.uid || isBootstrappedAdmin());
+        allow create: if isEmailVerified() && isValidId(userId) && isValidId(docId) &&
+          isValidUserPrivateInfo(incoming()) &&
+          incoming().uid == userId &&
+          incoming().createdAt == request.time &&
+          exists(/databases/$(database)/documents/users/$(userId)) &&
+          (isOwner(userId) || isAdmin());
+        allow update: if false;
+        allow delete: if isEmailVerified() && isValidId(userId) && isValidId(docId) && isAdmin();
+      }
+    }
+
+    // Collection 3: /vettingRules/{ruleId}
+    match /vettingRules/{ruleId} {
+      allow get: if isSignedIn() && isValidId(ruleId) && (existing().authorId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.authorId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isEmailVerified() && isValidId(ruleId) && isValidVettingRule(incoming()) &&
+        incoming().ruleId == ruleId &&
+        incoming().authorId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid));
+      allow update: if isEmailVerified() && isValidId(ruleId) && isValidVettingRule(incoming()) &&
+        incoming().ruleId == existing().ruleId &&
+        incoming().authorId == existing().authorId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          // Action 1: Toggle active state
+          (existing().authorId == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['isActive', 'updatedAt'])) ||
+          // Action 2: Edit rule metadata
+          ((existing().authorId == request.auth.uid || isAdmin()) && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'category', 'severity', 'description', 'criteriaSummary', 'isActive', 'updatedAt']))
+        );
+      allow delete: if isEmailVerified() && isValidId(ruleId) && (existing().authorId == request.auth.uid || isAdmin());
+    }
+
+    // Collection 4: /auditReports/{reportId}
+    match /auditReports/{reportId} {
+      allow get: if isSignedIn() && isValidId(reportId) && (existing().authorId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.authorId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isEmailVerified() && isValidId(reportId) && isValidAuditReport(incoming()) &&
+        incoming().reportId == reportId &&
+        incoming().authorId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid));
+      allow update: if isEmailVerified() && isValidId(reportId) && isValidAuditReport(incoming()) &&
+        incoming().reportId == existing().reportId &&
+        incoming().authorId == existing().authorId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          // Terminal State Lock: Once 'locked', non-admins cannot update
+          (existing().status != 'locked' && existing().authorId == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])) ||
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
+        );
+      allow delete: if isEmailVerified() && isValidId(reportId) && isAdmin();
+    }
+
+    // Collection 5: /alerts/{alertId}
+    match /alerts/{alertId} {
+      allow get: if isSignedIn() && isValidId(alertId) && (existing().authorId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.authorId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isEmailVerified() && isValidId(alertId) && isValidComplianceAlert(incoming()) &&
+        incoming().alertId == alertId &&
+        incoming().authorId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        exists(/databases/$(database)/documents/auditReports/$(incoming().reportId));
+      allow update: if isEmailVerified() && isValidId(alertId) && isValidComplianceAlert(incoming()) &&
+        incoming().alertId == existing().alertId &&
+        incoming().reportId == existing().reportId &&
+        incoming().authorId == existing().authorId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          // Terminal State Lock: Once 'resolved', non-admins cannot update
+          (existing().status != 'resolved' && existing().authorId == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])) ||
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
+        );
+      allow delete: if isEmailVerified() && isValidId(alertId) && isAdmin();
+    }
+
+    // Collection 6: /auditLogs/{logId} (Immutable HIPAA Audit Trail)
+    match /auditLogs/{logId} {
+      allow get: if isSignedIn() && isValidId(logId) && (existing().actorUid == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.actorUid == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isEmailVerified() && isValidId(logId) && isValidHipaaAuditLog(incoming()) &&
+        incoming().logId == logId &&
+        incoming().actorUid == request.auth.uid &&
+        incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if false;
+    }
+  }
+}

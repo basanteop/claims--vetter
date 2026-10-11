@@ -1,0 +1,6 @@
+{
+  "name": "NHIS Claims Vetting & Compliance Auditor",
+  "description": "HIPAA-compliant automated NHIS claims auditing platform that extracts vetting rules from PDF guidelines and validates XML claim batches with role-based access control and PDF/CSV reporting.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

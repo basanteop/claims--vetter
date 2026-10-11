@@ -1,0 +1,368 @@
+{
+  "entities": {
+    "AdminMarker": {
+      "title": "AdminMarker",
+      "description": "Trusted marker document for administrative privilege verification",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "createdAt"]
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Role-based access control profile without raw PII",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "role": {
+          "type": "string",
+          "enum": ["admin", "senior_auditor", "claims_officer", "viewer"]
+        },
+        "department": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "hipaaCertified": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "displayName", "role", "department", "hipaaCertified", "createdAt", "updatedAt"]
+    },
+    "UserPrivateInfo": {
+      "title": "UserPrivateInfo",
+      "description": "Isolated PII storage for user email and contact details",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "createdAt"]
+    },
+    "VettingRule": {
+      "title": "VettingRule",
+      "description": "NHIS compliance and billing rule extracted from PDF instructions",
+      "type": "object",
+      "properties": {
+        "ruleId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "code": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40
+        },
+        "title": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 160
+        },
+        "category": {
+          "type": "string",
+          "enum": ["Clinical", "Tariff", "Membership", "Pharmacy", "Documentation"]
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["critical", "high", "medium", "low"]
+        },
+        "description": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 1000
+        },
+        "criteriaSummary": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 1000
+        },
+        "sourceDocument": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "isActive": {
+          "type": "boolean"
+        },
+        "authorId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ruleId", "code", "title", "category", "severity", "description", "criteriaSummary", "sourceDocument", "isActive", "authorId", "createdAt", "updatedAt"]
+    },
+    "AuditReport": {
+      "title": "AuditReport",
+      "description": "Vetted NHIS XML batch audit report summary and compliance metadata",
+      "type": "object",
+      "properties": {
+        "reportId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "batchNumber": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "facilityName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "serviceMonth": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20
+        },
+        "serviceYear": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 10
+        },
+        "totalClaims": {
+          "type": "integer"
+        },
+        "totalBatchAmount": {
+          "type": "number"
+        },
+        "flaggedClaimsCount": {
+          "type": "integer"
+        },
+        "estimatedAdjustmentAmount": {
+          "type": "number"
+        },
+        "criticalAlertsCount": {
+          "type": "integer"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["in_review", "approved", "escalated", "locked"]
+        },
+        "hipaaEncryptionHash": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 128
+        },
+        "authorId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["reportId", "batchNumber", "facilityName", "serviceMonth", "serviceYear", "totalClaims", "totalBatchAmount", "flaggedClaimsCount", "estimatedAdjustmentAmount", "criticalAlertsCount", "status", "hipaaEncryptionHash", "authorId", "createdAt", "updatedAt"]
+    },
+    "ComplianceAlert": {
+      "title": "ComplianceAlert",
+      "description": "Automated alert for critical NHIS claim billing or clinical discrepancies",
+      "type": "object",
+      "properties": {
+        "alertId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "reportId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "batchNumber": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "claimId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "ruleCode": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["critical", "high", "medium"]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 200
+        },
+        "message": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 1000
+        },
+        "financialImpact": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["open", "acknowledged", "resolved"]
+        },
+        "authorId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["alertId", "reportId", "batchNumber", "claimId", "ruleCode", "severity", "title", "message", "financialImpact", "status", "authorId", "createdAt", "updatedAt"]
+    },
+    "HipaaAuditLog": {
+      "title": "HipaaAuditLog",
+      "description": "Immutable HIPAA security audit log entry",
+      "type": "object",
+      "properties": {
+        "logId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "actorUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "actorRole": {
+          "type": "string",
+          "enum": ["admin", "senior_auditor", "claims_officer", "viewer"]
+        },
+        "action": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "resourceType": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 80
+        },
+        "resourceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "details": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["logId", "actorUid", "actorRole", "action", "resourceType", "resourceId", "details", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/admins/{userId}": {
+      "schema": { "$ref": "#/entities/AdminMarker" },
+      "description": "Admin role lookup collection"
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "User RBAC profile collection without PII"
+    },
+    "/users/{userId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/UserPrivateInfo" },
+      "description": "Isolated PII subcollection for user email"
+    },
+    "/vettingRules/{ruleId}": {
+      "schema": { "$ref": "#/entities/VettingRule" },
+      "description": "Extracted PDF vetting instructions and rules"
+    },
+    "/auditReports/{reportId}": {
+      "schema": { "$ref": "#/entities/AuditReport" },
+      "description": "Saved NHIS XML claims vetting reports"
+    },
+    "/alerts/{alertId}": {
+      "schema": { "$ref": "#/entities/ComplianceAlert" },
+      "description": "Automated alerts for critical billing and clinical findings"
+    },
+    "/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/HipaaAuditLog" },
+      "description": "Immutable HIPAA data processing audit trail"
+    }
+  }
+}
