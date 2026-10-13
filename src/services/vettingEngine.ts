@@ -33,7 +33,7 @@ function calculateAgeYears(dobStr: string, refDateStr: string): number {
   return Math.max(0, age);
 }
 
-function getTagText(parent: Element, tagName: string): string {
+export function getTagText(parent: Element, tagName: string): string {
   const el = parent.getElementsByTagName(tagName)[0];
   return el ? (el.textContent || '').trim() : '';
 }
@@ -1900,6 +1900,282 @@ export function fixAllDiscrepanciesInXml(
   };
 }
 
+// ============================================================================
+// MANUAL BATCH FIX ENGINE: Manually fix an issue and propagate to other claims
+// ============================================================================
+
+export interface ManualFixParameters {
+  ruleCode: string;
+  actionType:
+    | 'replace_tariff'          // Change G-DRG / procedure code and tariff amount
+    | 'replace_icd'             // Replace ICD-10 diagnosis code
+    | 'remove_medicine'         // Remove non-indicated or contraindicated medicine
+    | 'replace_medicine'        // Replace one medicine code with an STG-compliant alternative
+    | 'adjust_medicine_qty'     // Cap or adjust medicine quantity & dosage
+    | 'set_referral'            // Attach referral/investigation form reference
+    | 'reclassify_service'      // Switch service type between INP and OUT with updated code/tariff
+    | 'append_investigation'    // Append missing diagnostic investigation (e.g. INVE75D)
+    | 'custom_rule_action';     // Apply tailored rule remediation with custom description
+  targetClaimId?: string;       // The original claim being fixed manually
+  targetMedicineCode?: string;
+  replacementMedicineCode?: string;
+  targetTreatmentCode?: string;
+  replacementTreatmentCode?: string;
+  newTariffAmount?: number;
+  targetIcdCode?: string;
+  replacementIcdCode?: string;
+  newQuantity?: number;
+  newDose?: string;
+  newFrequency?: number;
+  newDuration?: number;
+  referralNumber?: string;
+  newServiceType?: 'INP' | 'OUT';
+  investigationCode?: string;
+  customDescription?: string;
+}
+
+/**
+ * Manually fixes an issue on a claim or rule and applies the exact same fix
+ * to all other claims in the batch affected by the same discrepancy.
+ */
+export function manualBatchFix(
+  xmlContent: string,
+  rules: VettingRuleRecord[],
+  fixParams: ManualFixParameters,
+  targetClaimIds?: string[]
+): { updatedXml: string; fixLogs: XmlFixLogItem[]; affectedClaimsCount: number } {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xmlContent, 'text/xml');
+  const patientElements = Array.from(doc.getElementsByTagName('PatientData'));
+
+  // First vet current XML to find which claims currently fail this rule or condition
+  const currentVetted = parseAndVetNhisXml(xmlContent, rules);
+  const ruleDiscrepancies = currentVetted.discrepancies.filter((d) => d.ruleCode === fixParams.ruleCode);
+  const claimsWithSameIssue = new Set(ruleDiscrepancies.map((d) => d.claimId));
+
+  // If specific target claims provided, filter to them; otherwise apply to ALL claims with this issue
+  const eligibleClaimIds = targetClaimIds && targetClaimIds.length > 0
+    ? new Set(targetClaimIds)
+    : claimsWithSameIssue;
+
+  // Also include the primary target claim if specified
+  if (fixParams.targetClaimId) {
+    eligibleClaimIds.add(fixParams.targetClaimId);
+  }
+
+  const fixLogs: XmlFixLogItem[] = [];
+  let affectedClaimsCount = 0;
+
+  for (const patEl of patientElements) {
+    const claimElements = Array.from(patEl.getElementsByTagName('Claim'));
+    for (const claimEl of claimElements) {
+      const claimId = getTagText(claimEl, 'ClaimIdentificationNumber');
+      if (!eligibleClaimIds.has(claimId)) continue;
+
+      const matchingDiscrepancy = ruleDiscrepancies.find((d) => d.claimId === claimId);
+      const adjustmentGhs = matchingDiscrepancy?.financialAdjustmentGhs || 0;
+      let actionSummary = '';
+
+      const medicineEls = Array.from(claimEl.getElementsByTagName('Medicine'));
+      const treatmentEls = Array.from(claimEl.getElementsByTagName('Treatment'));
+      const treatmentsContainer = claimEl.getElementsByTagName('Treatments')[0];
+      const admDate = getTagText(claimEl, 'AdmissionDate');
+
+      switch (fixParams.actionType) {
+        case 'replace_tariff': {
+          const newCode = fixParams.replacementTreatmentCode || 'OPDC06A';
+          const newTariff = (fixParams.newTariffAmount ?? 24.09).toFixed(2);
+          const currentType = getTagText(claimEl, 'ServiceType');
+
+          if (currentType === 'INP' && fixParams.newServiceType !== 'OUT') {
+            setTagText(doc, claimEl, 'InPatientCode', newCode);
+            setTagText(doc, claimEl, 'InPatientTariffAmount', newTariff);
+          } else {
+            setTagText(doc, claimEl, 'OutPatientCode', newCode);
+            setTagText(doc, claimEl, 'OutPatientTariffAmount', newTariff);
+          }
+          setTagText(doc, claimEl, 'TotalCost', newTariff);
+
+          let updatedTreat = false;
+          for (const tEl of treatmentEls) {
+            const treatCode = getTagText(tEl, 'TreatmentCode');
+            if (!fixParams.targetTreatmentCode || treatCode === fixParams.targetTreatmentCode || parseFloat(getTagText(tEl, 'Tariff') || '0') > 0) {
+              setTagText(doc, tEl, 'TreatmentCode', newCode);
+              setTagText(doc, tEl, 'Tariff', newTariff);
+              updatedTreat = true;
+              break;
+            }
+          }
+          if (!updatedTreat && treatmentsContainer) {
+            const tNode = doc.createElement('Treatment');
+            setTagText(doc, tNode, 'Date', admDate);
+            setTagText(doc, tNode, 'Type', 'Diagnosis');
+            setTagText(doc, tNode, 'TreatmentCode', newCode);
+            setTagText(doc, tNode, 'Tariff', newTariff);
+            treatmentsContainer.appendChild(tNode);
+          }
+          actionSummary = `Manual Tariff Batch Fix: Reclassified to G-DRG ${newCode} (Tariff GHS ${newTariff})`;
+          break;
+        }
+
+        case 'replace_icd': {
+          const targetIcd = fixParams.targetIcdCode || '';
+          const newIcd = fixParams.replacementIcdCode || 'N94.6';
+          let replacedCount = 0;
+
+          for (const tEl of treatmentEls) {
+            const icd = getTagText(tEl, 'ICDCode');
+            if (!targetIcd || icd.includes(targetIcd)) {
+              setTagText(doc, tEl, 'ICDCode', newIcd);
+              replacedCount++;
+            }
+          }
+          actionSummary = `Manual ICD Batch Fix: Replaced diagnosis ${targetIcd || 'non-covered'} with covered ICD-10 ${newIcd} (${replacedCount} line(s))`;
+          break;
+        }
+
+        case 'remove_medicine': {
+          const targetMed = fixParams.targetMedicineCode || '';
+          let removedCount = 0;
+
+          for (const mEl of medicineEls) {
+            const code = getTagText(mEl, 'MedicineCode');
+            if (!targetMed || code === targetMed) {
+              mEl.parentNode?.removeChild(mEl);
+              removedCount++;
+            }
+          }
+          actionSummary = `Manual Medicine Batch Fix: Removed non-indicated medicine ${targetMed || 'item'} (${removedCount} line item(s) removed)`;
+          break;
+        }
+
+        case 'replace_medicine': {
+          const targetMed = fixParams.targetMedicineCode || '';
+          const newMed = fixParams.replacementMedicineCode || '';
+          let replacedCount = 0;
+
+          for (const mEl of medicineEls) {
+            const code = getTagText(mEl, 'MedicineCode');
+            if (!targetMed || code === targetMed) {
+              setTagText(doc, mEl, 'MedicineCode', newMed);
+              if (fixParams.newQuantity !== undefined) {
+                const up = parseFloat(getTagText(mEl, 'UnitPrice') || '0') || 0;
+                setTagText(doc, mEl, 'Quantity', String(fixParams.newQuantity));
+                setTagText(doc, mEl, 'MedicineTotal', (fixParams.newQuantity * up).toFixed(2));
+              }
+              const presEl = mEl.getElementsByTagName('Prescription')[0];
+              if (presEl) {
+                if (fixParams.newDose) setTagText(doc, presEl, 'Dose', fixParams.newDose);
+                if (fixParams.newFrequency) setTagText(doc, presEl, 'Frequency', String(fixParams.newFrequency));
+                if (fixParams.newDuration) setTagText(doc, presEl, 'Duration', String(fixParams.newDuration));
+              }
+              replacedCount++;
+            }
+          }
+          actionSummary = `Manual Medicine Batch Fix: Substituted ${targetMed} with STG-approved ${newMed}`;
+          break;
+        }
+
+        case 'adjust_medicine_qty': {
+          const targetMed = fixParams.targetMedicineCode || '';
+          const newQty = fixParams.newQuantity ?? 1;
+          let adjustedCount = 0;
+
+          for (const mEl of medicineEls) {
+            const code = getTagText(mEl, 'MedicineCode');
+            if (!targetMed || code === targetMed) {
+              const up = parseFloat(getTagText(mEl, 'UnitPrice') || '0') || 0;
+              setTagText(doc, mEl, 'Quantity', String(newQty));
+              setTagText(doc, mEl, 'MedicineTotal', (newQty * up).toFixed(2));
+              const presEl = mEl.getElementsByTagName('Prescription')[0];
+              if (presEl && fixParams.newDose) {
+                setTagText(doc, presEl, 'Dose', fixParams.newDose);
+              }
+              adjustedCount++;
+            }
+          }
+          actionSummary = `Manual Regimen Batch Fix: Adjusted ${targetMed || 'medicine'} quantity to ${newQty} unit(s)${fixParams.newDose ? ` (Dose: ${fixParams.newDose})` : ''}`;
+          break;
+        }
+
+        case 'set_referral': {
+          const ref = fixParams.referralNumber || `PHYSIO-REQ-${claimId.replace(/[^0-9]/g, '') || '2026'}`;
+          setTagText(doc, claimEl, 'ReferralNo', ref);
+          actionSummary = `Manual Referral Batch Fix: Attached referral/request identifier (${ref})`;
+          break;
+        }
+
+        case 'reclassify_service': {
+          const targetType = fixParams.newServiceType || 'OUT';
+          const targetCode = fixParams.replacementTreatmentCode || 'OPDC13C';
+          const targetTariff = (fixParams.newTariffAmount ?? 30.36).toFixed(2);
+
+          setTagText(doc, claimEl, 'ServiceType', targetType);
+          if (targetType === 'OUT') {
+            setTagText(doc, claimEl, 'InPatientCode', '');
+            setTagText(doc, claimEl, 'InPatientTariffAmount', '');
+            setTagText(doc, claimEl, 'OutPatientCode', targetCode);
+            setTagText(doc, claimEl, 'OutPatientTariffAmount', targetTariff);
+          } else {
+            setTagText(doc, claimEl, 'OutPatientCode', '');
+            setTagText(doc, claimEl, 'OutPatientTariffAmount', '');
+            setTagText(doc, claimEl, 'InPatientCode', targetCode);
+            setTagText(doc, claimEl, 'InPatientTariffAmount', targetTariff);
+          }
+          setTagText(doc, claimEl, 'TotalCost', targetTariff);
+          if (fixParams.referralNumber) {
+            setTagText(doc, claimEl, 'ReferralNo', fixParams.referralNumber);
+          }
+          actionSummary = `Manual Service Reclassification: Converted to ${targetType} under ${targetCode} (GHS ${targetTariff})`;
+          break;
+        }
+
+        case 'append_investigation': {
+          const labCode = fixParams.investigationCode || 'INVE75D';
+          if (treatmentsContainer) {
+            const invEl = doc.createElement('Treatment');
+            setTagText(doc, invEl, 'Date', admDate);
+            setTagText(doc, invEl, 'Type', 'Investigation');
+            setTagText(doc, invEl, 'TreatmentCode', labCode);
+            setTagText(doc, invEl, 'ICDCode', '');
+            setTagText(doc, invEl, 'Tariff', '0.00');
+            treatmentsContainer.appendChild(invEl);
+          }
+          actionSummary = `Manual Lab Attachment Batch Fix: Appended diagnostic investigation <TreatmentCode>${labCode}</TreatmentCode>`;
+          break;
+        }
+
+        case 'custom_rule_action':
+        default: {
+          const domSummary = applyRuleFixToClaimInDom(doc, patEl, claimEl, fixParams.ruleCode);
+          actionSummary = fixParams.customDescription
+            ? `Manual Batch Fix: ${fixParams.customDescription} (${domSummary})`
+            : `Manual Batch Fix: ${domSummary}`;
+          break;
+        }
+      }
+
+      affectedClaimsCount++;
+      fixLogs.push({
+        id: `manual_batch_${Date.now()}_${fixLogs.length + 1}`,
+        claimId,
+        ruleCode: fixParams.ruleCode,
+        ruleTitle: `MANUAL BATCH FIX: ${matchingDiscrepancy?.ruleTitle || fixParams.ruleCode}`,
+        actionTaken: actionSummary,
+        amountAdjustedGhs: adjustmentGhs,
+        timestamp: new Date().toLocaleTimeString(),
+      });
+    }
+  }
+
+  recalculateXmlBatchTotals(doc);
+  return {
+    updatedXml: serializeXmlDocument(doc),
+    fixLogs,
+    affectedClaimsCount,
+  };
+}
+
 // Save manual edits made in the Interactive Claim XML Editor back into the XML string
 export function updateClaimManuallyInXml(
   xmlContent: string,
@@ -1999,7 +2275,7 @@ export function updateClaimManuallyInXml(
   return serializeXmlDocument(doc);
 }
 
-// Format and download the fixed NHIS XML file
+// Format and download the fixed NHIS XML file (legacy fallback)
 export function downloadFixedNhisXml(xmlContent: string, batchNumber: string): void {
   const cleanBatch = batchNumber.replace(/[^a-zA-Z0-9_-]/g, '_');
   const blob = new Blob([xmlContent], { type: 'application/xml;charset=utf-8;' });
@@ -2012,5 +2288,174 @@ export function downloadFixedNhisXml(xmlContent: string, batchNumber: string): v
   document.body.removeChild(link);
   URL.revokeObjectURL(url);
 }
+
+export interface ConsolidatedXmlResult {
+  consolidatedXml: string;
+  totalClaimsCount: number;
+  cleanClaimsCount: number;
+  fixedClaimsCount: number;
+  batchTotalAmountGhs: number;
+  batchNumber: string;
+}
+
+/**
+ * Merges remediated/fixed claims back into the original clean XML file.
+ * Preserves all original clean claims from baseCleanXml and replaces/merges matching
+ * claim nodes with the updated remediated claims from remediatedXml.
+ * Recalculates ClaimsCount, MedicinesCount, TreatmentsCount, and BatchAmount.
+ */
+export function buildConsolidatedXml(
+  baseCleanXml: string,
+  remediatedXml: string,
+  fixedClaimIds?: string[]
+): ConsolidatedXmlResult {
+  const parser = new DOMParser();
+  const baseDoc = parser.parseFromString(baseCleanXml, 'text/xml');
+  const remediatedDoc = parser.parseFromString(remediatedXml, 'text/xml');
+
+  // Collect all PatientData elements from remediated XML
+  const remediatedPatients = Array.from(remediatedDoc.getElementsByTagName('PatientData'));
+  const remediatedClaimMap = new Map<string, Element>();
+
+  for (const patEl of remediatedPatients) {
+    const claimEls = Array.from(patEl.getElementsByTagName('Claim'));
+    for (const cEl of claimEls) {
+      const cid = getTagText(cEl, 'ClaimIdentificationNumber');
+      if (cid) {
+        if (!fixedClaimIds || fixedClaimIds.length === 0 || fixedClaimIds.includes(cid)) {
+          remediatedClaimMap.set(cid, patEl);
+        }
+      }
+    }
+  }
+
+  // Ensure baseDoc has a Patients container
+  let basePatientsContainer = baseDoc.getElementsByTagName('Patients')[0];
+  if (!basePatientsContainer) {
+    basePatientsContainer = baseDoc.createElement('Patients');
+    baseDoc.documentElement.appendChild(basePatientsContainer);
+  }
+
+  const existingBasePatients = Array.from(baseDoc.getElementsByTagName('PatientData'));
+  const handledFixedClaimIds = new Set<string>();
+
+  // Replace matching claims in baseDoc with the remediated PatientData
+  for (const basePatEl of existingBasePatients) {
+    const baseClaimEls = Array.from(basePatEl.getElementsByTagName('Claim'));
+    for (const baseCEl of baseClaimEls) {
+      const baseCid = getTagText(baseCEl, 'ClaimIdentificationNumber');
+      if (baseCid && remediatedClaimMap.has(baseCid)) {
+        const replacementPatEl = remediatedClaimMap.get(baseCid)!;
+        const importedNode = baseDoc.importNode(replacementPatEl, true);
+        basePatEl.parentNode?.replaceChild(importedNode, basePatEl);
+        handledFixedClaimIds.add(baseCid);
+        break;
+      }
+    }
+  }
+
+  // If there are remediated claims not in baseDoc (e.g. an external clean file that omitted them),
+  // append them to Patients container
+  for (const [cid, fixedPatEl] of remediatedClaimMap.entries()) {
+    if (!handledFixedClaimIds.has(cid)) {
+      const importedNode = baseDoc.importNode(fixedPatEl, true);
+      basePatientsContainer.appendChild(importedNode);
+      handledFixedClaimIds.add(cid);
+    }
+  }
+
+  recalculateXmlBatchTotals(baseDoc);
+
+  // Calculate final statistics
+  const finalPatients = Array.from(baseDoc.getElementsByTagName('PatientData'));
+  let finalClaimsCount = 0;
+  for (const p of finalPatients) {
+    finalClaimsCount += p.getElementsByTagName('Claim').length;
+  }
+
+  const batchInfoEl = baseDoc.getElementsByTagName('BatchInformation')[0];
+  const batchNum = batchInfoEl ? getTagText(batchInfoEl, 'BatchNumber') || 'NHIS-BATCH' : 'NHIS-BATCH';
+  const batchAmt = batchInfoEl ? parseFloat(getTagText(batchInfoEl, 'BatchAmount') || '0') || 0 : 0;
+  const fixedCount = handledFixedClaimIds.size;
+  const cleanCount = Math.max(0, finalClaimsCount - fixedCount);
+
+  return {
+    consolidatedXml: serializeXmlDocument(baseDoc),
+    totalClaimsCount: finalClaimsCount,
+    cleanClaimsCount: cleanCount,
+    fixedClaimsCount: fixedCount,
+    batchTotalAmountGhs: Number(batchAmt.toFixed(2)),
+    batchNumber: batchNum,
+  };
+}
+
+/**
+ * Extracts an XML batch containing ONLY the fixed/remediated claims.
+ */
+export function extractFixedClaimsOnlyXml(
+  xmlContent: string,
+  fixedClaimIds: string[]
+): string {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xmlContent, 'text/xml');
+  const patientElements = Array.from(doc.getElementsByTagName('PatientData'));
+
+  for (const patEl of patientElements) {
+    const claimElements = Array.from(patEl.getElementsByTagName('Claim'));
+    const hasFixed = claimElements.some((c) => {
+      const cid = getTagText(c, 'ClaimIdentificationNumber');
+      return cid && fixedClaimIds.includes(cid);
+    });
+    if (!hasFixed) {
+      patEl.parentNode?.removeChild(patEl);
+    }
+  }
+
+  recalculateXmlBatchTotals(doc);
+  return serializeXmlDocument(doc);
+}
+
+/**
+ * Downloads the entire consolidated XML file (clean claims + remediated claims merged together).
+ */
+export function downloadEntireConsolidatedNhisXml(
+  xmlContent: string,
+  batchNumber: string,
+  customFileName?: string
+): void {
+  const cleanBatch = batchNumber.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const fileName = customFileName || `NHIS_ENTIRE_BATCH_${cleanBatch}_CLEAN_AND_FIXED.xml`;
+  const blob = new Blob([xmlContent], { type: 'application/xml;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.setAttribute('download', fileName);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+/**
+ * Downloads an XML file containing only the remediated claims.
+ */
+export function downloadFixedOnlyNhisXml(
+  xmlContent: string,
+  batchNumber: string,
+  customFileName?: string
+): void {
+  const cleanBatch = batchNumber.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const fileName = customFileName || `NHIS_REMEDIATED_CLAIMS_ONLY_${cleanBatch}.xml`;
+  const blob = new Blob([xmlContent], { type: 'application/xml;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.setAttribute('download', fileName);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
 
 
